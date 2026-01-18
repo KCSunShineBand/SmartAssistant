@@ -89,6 +89,26 @@ def init_db() -> None:
               PRIMARY KEY (chat_id, message_id)
             );
 
+            -- Persistent Notes (MVP)
+            CREATE TABLE IF NOT EXISTS notes (
+              id UUID PRIMARY KEY,
+              chat_id BIGINT NOT NULL,
+              text TEXT NOT NULL,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+
+            -- Persistent Tasks (MVP)
+            CREATE TABLE IF NOT EXISTS tasks (
+              id UUID PRIMARY KEY,
+              chat_id BIGINT NOT NULL,
+              text TEXT NOT NULL,
+              done BOOLEAN NOT NULL DEFAULT FALSE,
+              done_at TIMESTAMPTZ,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+
             CREATE TABLE IF NOT EXISTS embedding_chunks (
               id BIGSERIAL PRIMARY KEY,
               kind TEXT NOT NULL,              -- 'note' | 'task'
@@ -118,6 +138,12 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_embedding_kind_page
               ON embedding_chunks (kind, notion_page_id);
+
+            CREATE INDEX IF NOT EXISTS idx_notes_chat_created
+              ON notes (chat_id, created_at DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_tasks_chat_done_created
+              ON tasks (chat_id, done, created_at DESC);
             """
         )
 
@@ -135,7 +161,168 @@ def db_health() -> dict:
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-# db.py (add below init_db)
+
+def create_note(chat_id: int, text: str) -> str:
+    """
+    Insert a persistent note. Returns note_id (UUID string).
+    """
+    if not isinstance(chat_id, int) or chat_id <= 0:
+        raise ValueError("chat_id must be a positive int")
+
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("text must be non-empty")
+
+    note_id = str(uuid.uuid4())
+
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO notes (id, chat_id, text)
+            VALUES (%s::uuid, %s, %s);
+            """,
+            (note_id, chat_id, text),
+        )
+
+    return note_id
+
+
+def create_task(chat_id: int, text: str) -> str:
+    """
+    Insert a persistent task (done=false). Returns task_id (UUID string).
+    """
+    if not isinstance(chat_id, int) or chat_id <= 0:
+        raise ValueError("chat_id must be a positive int")
+
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("text must be non-empty")
+
+    task_id = str(uuid.uuid4())
+
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO tasks (id, chat_id, text, done)
+            VALUES (%s::uuid, %s, %s, FALSE);
+            """,
+            (task_id, chat_id, text),
+        )
+
+    return task_id
+
+
+def list_open_tasks(chat_id: int, limit: int = 5) -> list[dict]:
+    """
+    List most-recent open tasks for a chat_id.
+    """
+    if not isinstance(chat_id, int) or chat_id <= 0:
+        raise ValueError("chat_id must be a positive int")
+    if not isinstance(limit, int) or limit <= 0:
+        limit = 5
+
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id::text, text, done, created_at
+            FROM tasks
+            WHERE chat_id = %s AND done = FALSE
+            ORDER BY created_at DESC
+            LIMIT %s;
+            """,
+            (chat_id, limit),
+        ).fetchall()
+
+    return [{"id": r[0], "text": r[1], "done": bool(r[2]), "created_at": r[3].isoformat()} for r in rows]
+
+
+def mark_task_done(chat_id: int, task_id: str) -> bool:
+    """
+    Mark a task done. Returns True if updated, False if not found/already done/invalid id.
+    """
+    if not isinstance(chat_id, int) or chat_id <= 0:
+        raise ValueError("chat_id must be a positive int")
+
+    task_id = (task_id or "").strip()
+    if not task_id:
+        raise ValueError("task_id must be non-empty")
+
+    # Validate UUID to avoid DB exceptions like:
+    # psycopg.errors.InvalidTextRepresentation: invalid input syntax for type uuid
+    try:
+        uuid.UUID(task_id)
+    except Exception:
+        return False
+
+    with connect() as conn:
+        cur = conn.execute(
+            """
+            UPDATE tasks
+            SET done = TRUE,
+                done_at = NOW(),
+                updated_at = NOW()
+            WHERE chat_id = %s
+              AND id = %s::uuid
+              AND done = FALSE;
+            """,
+            (chat_id, task_id),
+        )
+        return bool(cur.rowcount and cur.rowcount > 0)
+
+
+
+def search_notes_tasks(chat_id: int, query: str, limit: int = 10) -> list[dict]:
+    """
+    Simple keyword search across tasks + notes for a chat.
+    Returns unified list sorted by created_at desc.
+    """
+    if not isinstance(chat_id, int) or chat_id <= 0:
+        raise ValueError("chat_id must be a positive int")
+
+    query = (query or "").strip()
+    if not query:
+        raise ValueError("query must be non-empty")
+
+    if not isinstance(limit, int) or limit <= 0:
+        limit = 10
+
+    like = f"%{query}%"
+
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT kind, id, text, done, created_at
+            FROM (
+              SELECT 'task'::text AS kind, id::text AS id, text, done, created_at
+              FROM tasks
+              WHERE chat_id = %s AND text ILIKE %s
+
+              UNION ALL
+
+              SELECT 'note'::text AS kind, id::text AS id, text, NULL::boolean AS done, created_at
+              FROM notes
+              WHERE chat_id = %s AND text ILIKE %s
+            ) x
+            ORDER BY created_at DESC
+            LIMIT %s;
+            """,
+            (chat_id, like, chat_id, like, limit),
+        ).fetchall()
+
+    out = []
+    for kind, _id, text, done, created_at in rows:
+        out.append(
+            {
+                "kind": kind,
+                "id": _id,
+                "text": text,
+                "done": None if done is None else bool(done),
+                "created_at": created_at.isoformat(),
+            }
+        )
+    return out
+
+
 
 def get_setting(key: str) -> str | None:
     """
