@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+*.log
+
+# Virtual env
+.venv/
+
+# Local gcloud creds (you created this to fix WinError 5)
+.gcloud/
+
+# Secrets
+*.env
+.env.*
