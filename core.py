@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-
+import notion
 import db
 
 from dataclasses import dataclass, field
@@ -54,11 +54,12 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
     """
     Core app handler.
 
-    Persistence strategy:
-    - If DATABASE_URL is set -> use Postgres via db.py (persistent across Cloud Run instances/revisions)
-    - Else -> use in-memory state (local/dev)
+    PRD v1.5 persistence:
+    - Notion is source of truth for Notes/Tasks when configured.
+    - Postgres is used for settings/labels/message_map/jobs/embeddings (NOT raw note/task bodies).
+    - If Notion is not configured, fall back to existing DB/in-memory behavior.
 
-    MVP actions supported:
+    Supported:
     - /note <text>
     - /todo <text>
     - /today
@@ -78,12 +79,61 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
     def reply(msg: str) -> List[Dict[str, Any]]:
         return [{"type": "reply", "chat_id": chat_id, "text": msg}]
 
-    # DB mode switch
+    # Existing DB mode switch
     db_enabled = bool(os.getenv("DATABASE_URL", "").strip())
 
-    # In-memory buckets (still used for dev mode)
+    # ---- Notion mode switch ----
+    notion_token = (os.getenv("NOTION_TOKEN") or "").strip()
+    notes_db_id = (os.getenv("NOTION_NOTES_DB_ID") or "").strip()
+    tasks_db_id = (os.getenv("NOTION_TASKS_DB_ID") or "").strip()
+
+    if db_enabled and (not notes_db_id or not tasks_db_id):
+        # Best-effort: load Notion IDs from Postgres settings
+        try:
+            db.init_db()
+            if not notes_db_id:
+                notes_db_id = (db.get_setting("notion_notes_db_id") or "").strip()
+            if not tasks_db_id:
+                tasks_db_id = (db.get_setting("notion_tasks_db_id") or "").strip()
+        except Exception:
+            pass
+
+    notion_enabled = bool(notion_token and notes_db_id and tasks_db_id)
+
+    # In-memory buckets (dev fallback)
     state.notes.setdefault(chat_id, [])
     state.tasks.setdefault(chat_id, [])
+
+    def _make_title(s: str, max_len: int = 80) -> str:
+        s = (s or "").strip()
+        if not s:
+            return "Untitled"
+        first = s.splitlines()[0].strip()
+        if len(first) <= max_len:
+            return first
+        return first[: max_len - 3] + "..."
+
+    def _save_message_map(kind: str, notion_page_id: str) -> None:
+        """
+        Best-effort traceability: Telegram message -> Notion page.
+        Runs only when DB enabled and message_id exists.
+        """
+        try:
+            mid = event.get("message_id")
+            uid = event.get("user_id")
+            if (not db_enabled) or mid is None:
+                return
+
+            db.init_db()
+            db.save_message_map(
+                message_id=int(mid),
+                kind=str(kind),
+                notion_page_id=str(notion_page_id),
+                chat_id=int(chat_id),
+                user_id=int(uid) if uid is not None else None,
+            )
+        except Exception:
+            return
 
     if route.get("kind") == "command":
         cmd = route.get("command")
@@ -93,30 +143,69 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
             if not note_text:
                 return reply("Missing text. Usage: /note <text>")
 
+            if notion_enabled:
+                page_id = notion.create_note(
+                    notes_db_id,
+                    title=_make_title(note_text),
+                    text=note_text,
+                    note_type="other",
+                    tags=[],
+                    labels=[],
+                    source="telegram",
+                    telegram_message_link=None,
+                )
+                _save_message_map("note", page_id)
+                return reply(f"Saved note (Notion): {page_id}")
+
             if db_enabled:
                 db.init_db()
                 nid = db.create_note(chat_id, note_text)
                 return reply(f"Saved note: {nid}")
-            else:
-                nid = _next_id(state, "note")
-                state.notes[chat_id].append(Note(id=nid, text=note_text, created_at=_now_iso()))
-                return reply(f"Saved note: {nid}")
+
+            nid = _next_id(state, "note")
+            state.notes[chat_id].append(Note(id=nid, text=note_text, created_at=_now_iso()))
+            return reply(f"Saved note: {nid}")
 
         if cmd == "todo":
             task_text = (route.get("text") or "").strip()
             if not task_text:
                 return reply("Missing text. Usage: /todo <text>")
 
+            if notion_enabled:
+                page_id = notion.create_task(
+                    tasks_db_id,
+                    title=task_text,
+                    status="todo",
+                    due=None,
+                    priority="med",
+                    labels=[],
+                    source="telegram",
+                    source_note_page_ids=None,
+                )
+                _save_message_map("task", page_id)
+                return reply(f"Added task (Notion): {page_id}")
+
             if db_enabled:
                 db.init_db()
                 tid = db.create_task(chat_id, task_text)
                 return reply(f"Added task: {tid}")
-            else:
-                tid = _next_id(state, "task")
-                state.tasks[chat_id].append(Task(id=tid, text=task_text, created_at=_now_iso()))
-                return reply(f"Added task: {tid}")
+
+            tid = _next_id(state, "task")
+            state.tasks[chat_id].append(Task(id=tid, text=task_text, created_at=_now_iso()))
+            return reply(f"Added task: {tid}")
 
         if cmd == "today":
+            if notion_enabled:
+                tasks = notion.list_open_tasks(tasks_db_id, limit=5)
+                if not tasks:
+                    return reply("No open tasks. Go touch grass 🌱")
+
+                lines = []
+                for t in tasks:
+                    due = f" (due {t['due']})" if t.get("due") else ""
+                    lines.append(f"- {t['id']}: {t.get('title','').strip()}{due}")
+                return reply(f"Open tasks: {len(tasks)}\n" + "\n".join(lines))
+
             if db_enabled:
                 db.init_db()
                 open_tasks = db.list_open_tasks(chat_id, limit=5)
@@ -124,17 +213,52 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
                     return reply("No open tasks. Go touch grass 🌱")
                 preview = "\n".join([f"- {t['id']}: {t['text']}" for t in open_tasks])
                 return reply(f"Open tasks: {len(open_tasks)}\n{preview}")
-            else:
-                open_tasks = [t for t in state.tasks[chat_id] if not t.done]
+
+            open_tasks = [t for t in state.tasks[chat_id] if not t.done]
+            if not open_tasks:
+                return reply("No open tasks. Go touch grass 🌱")
+            preview = "\n".join([f"- {t.id}: {t.text}" for t in open_tasks[-5:]])
+            return reply(f"Open tasks: {len(open_tasks)}\n{preview}")
+
+        if cmd == "inbox":
+            if notion_enabled:
+                tasks = notion.list_inbox_tasks(tasks_db_id, limit=20)
+                if not tasks:
+                    return reply("Inbox is empty. Suspiciously productive. 😎")
+
+                lines = []
+                for t in tasks:
+                    due = f" (due {t['due']})" if t.get("due") else ""
+                    status = t.get("status") or "todo"
+                    lines.append(f"- [{status}] {t['id']}: {t.get('title','').strip()}{due}")
+
+                return reply("Inbox (open tasks):\n" + "\n".join(lines))
+
+            if db_enabled:
+                db.init_db()
+                open_tasks = db.list_open_tasks(chat_id, limit=20)
                 if not open_tasks:
-                    return reply("No open tasks. Go touch grass 🌱")
-                preview = "\n".join([f"- {t.id}: {t.text}" for t in open_tasks[-5:]])
-                return reply(f"Open tasks: {len(open_tasks)}\n{preview}")
+                    return reply("Inbox is empty. Suspiciously productive. 😎")
+                preview = "\n".join([f"- {t['id']}: {t['text']}" for t in open_tasks])
+                return reply("Inbox (open tasks):\n" + preview)
+
+            open_tasks = [t for t in state.tasks[chat_id] if not t.done]
+            if not open_tasks:
+                return reply("Inbox is empty. Suspiciously productive. 😎")
+            preview = "\n".join([f"- {t.id}: {t.text}" for t in open_tasks[-20:]])
+            return reply("Inbox (open tasks):\n" + preview)
+
 
         if cmd == "done":
             task_id = (route.get("task_id") or "").strip()
             if not task_id:
                 return reply("Missing task id. Usage: /done <task_id>")
+
+            if notion_enabled:
+                ok = notion.mark_task_done(task_id)
+                if ok:
+                    return reply(f"Marked done (Notion): {task_id}")
+                return reply(f"Task not found (Notion): {task_id}")
 
             if db_enabled:
                 db.init_db()
@@ -142,14 +266,15 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
                 if ok:
                     return reply(f"Marked done: {task_id}")
                 return reply(f"Task not found (or already done): {task_id}")
-            else:
-                for t in state.tasks[chat_id]:
-                    if t.id == task_id:
-                        if t.done:
-                            return reply(f"{task_id} is already done.")
-                        t.done = True
-                        return reply(f"Marked done: {task_id}")
-                return reply(f"Task not found: {task_id}")
+
+            for t in state.tasks[chat_id]:
+                if t.id == task_id:
+                    if t.done:
+                        return reply(f"{task_id} is already done.")
+                    t.done = True
+                    return reply(f"Marked done: {task_id}")
+            return reply(f"Task not found: {task_id}")
+
 
         if cmd == "search":
             q = (route.get("query") or "").strip()
@@ -163,7 +288,6 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
                     return reply(f'No results for: "{q}"')
 
                 lines = [f'Results for: "{q}"']
-                # Keep it compact
                 for h in hits[:10]:
                     if h["kind"] == "task":
                         status = "✅" if h.get("done") else "☐"
@@ -175,7 +299,6 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
                         lines.append(f"- 📝 {h['id']}: {snippet}")
                 return reply("\n".join(lines))
 
-            # dev/in-memory search
             ql = q.lower()
             task_hits = []
             for t in state.tasks[chat_id]:
@@ -203,32 +326,118 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
                 lines.extend([f"- {x}" for x in note_hits[:5]])
             return reply("\n".join(lines))
 
+        if cmd == "settings":
+            # MVP parser: "/settings" or "/settings set <key> <value>"
+            raw = (event.get("text") or "").strip()
+            parts = raw.split()
+
+            if db_enabled:
+                db.init_db()
+
+            def _get(k: str, default: str = "") -> str:
+                if not db_enabled:
+                    return default
+                v = db.get_setting(k, default)
+                return "" if v is None else str(v)
+
+            def _set(k: str, v: str) -> None:
+                if not db_enabled:
+                    return
+                db.set_setting(k, v)
+
+            if len(parts) >= 4 and parts[1] == "set":
+                key = parts[2].strip()
+                value = " ".join(parts[3:]).strip()
+
+                allowed = {
+                    "timezone",
+                    "daily_brief_time",
+                    "privacy_mode",
+                    "ai_enabled",
+                }
+                if key not in allowed:
+                    return reply(f"Invalid key. Allowed: {', '.join(sorted(allowed))}")
+
+                # very light validation
+                if key == "daily_brief_time":
+                    # expect HH:MM
+                    if len(value) != 5 or value[2] != ":":
+                        return reply("daily_brief_time must be HH:MM (e.g., 07:30)")
+                if key == "ai_enabled":
+                    v2 = value.lower()
+                    if v2 in {"1", "true", "yes", "on"}:
+                        value = "true"
+                    elif v2 in {"0", "false", "no", "off"}:
+                        value = "false"
+                    else:
+                        return reply("ai_enabled must be true/false")
+
+                _set(key, value)
+                return reply(f"Updated {key} = {value}")
+
+            # Show settings
+            tz = _get("timezone", "Asia/Singapore")
+            brief = _get("daily_brief_time", "07:30")
+            privacy = _get("privacy_mode", "A")  # PRD: A/B
+            ai_enabled = _get("ai_enabled", "true")
+
+            return reply(
+                "Settings:\n"
+                f"- timezone: {tz}\n"
+                f"- daily_brief_time: {brief}\n"
+                f"- privacy_mode: {privacy}\n"
+                f"- ai_enabled: {ai_enabled}\n\n"
+                "Update with:\n"
+                "/settings set <key> <value>\n"
+                "Keys: timezone, daily_brief_time, privacy_mode, ai_enabled"
+            )
+
+
         if cmd == "help":
             return reply(
                 "Commands:\n"
                 "/note <text>\n"
                 "/todo <text>\n"
+                "/inbox\n"
                 "/today\n"
                 "/done <task_id>\n"
+                "/settings\n"
                 "/search <query>"
+
+
             )
 
         return reply(f"Command not implemented yet: /{cmd}")
+    
 
-    # Plain text path: treat as a note capture
+    # Plain text -> note capture
     if route.get("kind") == "text":
         note_text = (route.get("text") or "").strip()
         if not note_text:
             return reply("Empty message")
 
+        if notion_enabled:
+            page_id = notion.create_note(
+                notes_db_id,
+                title=_make_title(note_text),
+                text=note_text,
+                note_type="other",
+                tags=[],
+                labels=[],
+                source="telegram",
+                telegram_message_link=None,
+            )
+            _save_message_map("note", page_id)
+            return reply(f"Saved note (Notion): {page_id}")
+
         if db_enabled:
             db.init_db()
             nid = db.create_note(chat_id, note_text)
             return reply(f"Saved note: {nid}")
-        else:
-            nid = _next_id(state, "note")
-            state.notes[chat_id].append(Note(id=nid, text=note_text, created_at=_now_iso()))
-            return reply(f"Saved note: {nid}")
+
+        nid = _next_id(state, "note")
+        state.notes[chat_id].append(Note(id=nid, text=note_text, created_at=_now_iso()))
+        return reply(f"Saved note: {nid}")
 
     if route.get("kind") == "unknown_command":
         return reply(f"Unknown command: /{route.get('command')} (try /help)")

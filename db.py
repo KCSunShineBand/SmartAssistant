@@ -20,14 +20,33 @@ from typing import Sequence
 def get_db_url() -> str:
     """
     Source of truth for DB connection.
-    Must be set via env var DATABASE_URL.
-    Example:
-      postgresql://postgres:postgres@localhost:5432/smartassistant
+
+    Normal runtime:
+      - uses DATABASE_URL
+
+    Test runtime (pytest):
+      - if TEST_DATABASE_URL is set -> uses TEST_DATABASE_URL
+      - else -> defaults to local docker postgres:
+          postgresql://postgres:postgres@localhost:5432/smartassistant
+
+    Why:
+      - Lets you keep DATABASE_URL pointing to Cloud SQL sockets/URLs for GCP
+      - While pytest uses a local DB that actually exists on your laptop
     """
+    is_pytest = bool(os.getenv("PYTEST_CURRENT_TEST")) or os.getenv("APP_ENV", "").lower() in {"test", "testing"}
+
+    if is_pytest:
+        test_url = os.getenv("TEST_DATABASE_URL", "").strip()
+        if test_url:
+            return test_url
+        # sensible default for local docker-compose dev
+        return "postgresql://postgres:postgres@localhost:5432/smartassistant"
+
     url = os.getenv("DATABASE_URL", "").strip()
     if not url:
         raise RuntimeError("DATABASE_URL is not set")
     return url
+
 
 
 # db.py
