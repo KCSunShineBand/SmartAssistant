@@ -130,6 +130,28 @@ def normalize_update(update: Dict[str, Any]) -> Dict[str, Any]:
 def health() -> Dict[str, bool]:
     return {"ok": True}
 
+@app.get("/debug/env")
+def debug_env(x_admin_key: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    """
+    Debug helper: returns ONLY environment variable NAMES (never values).
+
+    Security:
+    - Requires X-Admin-Key header.
+    - Key comes from ADMIN_DEBUG_KEY, or falls back to ADMIN_SETUP_KEY.
+    - If no key is configured, endpoint returns 404 (acts like it doesn't exist).
+    """
+    required_key = (os.getenv("ADMIN_DEBUG_KEY") or os.getenv("ADMIN_SETUP_KEY") or "").strip()
+
+    if not required_key:
+        # Hide endpoint entirely if not configured
+        raise HTTPException(status_code=404, detail="Not found")
+
+    if (x_admin_key or "").strip() != required_key:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    names = sorted(os.environ.keys())
+    return {"ok": True, "count": len(names), "names": names}
+
 
 @app.post("/telegram/webhook")
 async def telegram_webhook(request: Request):
