@@ -53,9 +53,12 @@ def test_mark_task_done_patches_page(monkeypatch):
         calls.append((method, url, json))
         assert method == "PATCH"
         assert url.endswith("/v1/pages/p1")
-        assert json["properties"]["Status"]["select"]["name"] == "done"
+        # Status is a Notion `status` property (NOT select)
+        assert json["properties"]["Status"]["status"]["name"] == "done"
         assert "Completed At" in json["properties"]
+        assert "start" in json["properties"]["Completed At"]["date"]
         return FakeResp(200, {"id": "p1"})
 
     monkeypatch.setattr("requests.request", fake_request)
     assert notion.mark_task_done("p1") is True
+    assert len(calls) == 1

@@ -342,12 +342,18 @@ def search_notes_tasks(chat_id: int, query: str, limit: int = 10) -> list[dict]:
     return out
 
 
+def get_setting(key: str, default: str | None = None) -> str | None:
+    """
+    Returns the setting value for key.
 
-def get_setting(key: str) -> str | None:
+    - If the key exists -> returns stored value (string).
+    - If missing -> returns `default` (defaults to None).
+
+    Why:
+    - core.py and main.py already call get_setting(key, default)
+      and should not crash when a setting is missing.
     """
-    Returns the setting value for key, or None if missing.
-    """
-    key = key.strip()
+    key = (key or "").strip()
     if not key:
         raise ValueError("key must be non-empty")
 
@@ -356,7 +362,11 @@ def get_setting(key: str) -> str | None:
             "SELECT value FROM settings WHERE key = %s;",
             (key,),
         ).fetchone()
-    return row[0] if row else None
+
+    if row:
+        return row[0]
+    return default
+
 
 
 def set_setting(key: str, value: str) -> None:

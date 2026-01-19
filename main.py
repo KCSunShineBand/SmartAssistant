@@ -14,6 +14,8 @@ import notion
 
 from ui import parse_callback, route_text
 from core import AppState, handle_event
+from core import handle_event, build_daily_brief_text
+
 
 import os
 import requests
@@ -203,6 +205,19 @@ async def telegram_webhook(request: Request):
                 "actions": [],
             }
 
+    # --- NEW: persist chat_id (best-effort) so /cron/daily-brief can run without TELEGRAM_CHAT_ID ---
+    if os.getenv("DATABASE_URL", "").strip():
+        try:
+            db.init_db()
+            cid = event.get("chat_id")
+            if isinstance(cid, int):
+                db.set_setting("telegram_chat_id", str(cid))
+            if allowed_user_id is not None:
+                db.set_setting("telegram_allowed_user_id", str(allowed_user_id))
+        except Exception:
+            # Never let DB issues break webhook handling
+            pass
+
     actions = handle_event(event, STATE)
 
     sent = 0
@@ -221,6 +236,7 @@ async def telegram_webhook(request: Request):
             errors += 1
 
     return {"ok": True, "type": event_type, "sent": sent, "errors": errors, "actions": actions}
+
 
 
 @app.post("/admin/notion/setup")
@@ -290,3 +306,96 @@ async def admin_notion_setup(
         "tasks_db_id": tasks_db_id,
         "seeded_labels": len(default_labels),
     }
+
+
+@app.post("/cron/daily-brief")
+async def cron_daily_brief(
+    request: Request,
+    x_cron_key: Optional[str] = Header(default=None),
+):
+    """
+    Trigger Daily Brief send (intended for Cloud Scheduler).
+
+    Cloud Scheduler often sends Content-Type: application/octet-stream even if you
+    try to set application/json. So we parse the raw body ourselves and treat it
+    as JSON when possible.
+
+    Security:
+      - If CRON_DAILY_BRIEF_KEY env var is set, require header X-Cron-Key to match.
+
+    Target chat:
+      - payload.chat_id (preferred override)
+      - else TELEGRAM_CHAT_ID env var
+      - else (if DATABASE_URL set) settings.telegram_chat_id from Postgres
+    """
+    import json as _json
+
+    required_key = os.getenv("CRON_DAILY_BRIEF_KEY", "").strip()
+    if required_key and x_cron_key != required_key:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    # Parse payload from raw request body (works regardless of Content-Type)
+    payload: dict = {}
+    try:
+        raw = await request.body()
+        if raw:
+            try:
+                payload_obj = _json.loads(raw.decode("utf-8"))
+                if isinstance(payload_obj, dict):
+                    payload = payload_obj
+            except Exception:
+                payload = {}
+    except Exception:
+        payload = {}
+
+    chat_id = None
+
+    # payload override
+    if payload.get("chat_id") is not None:
+        try:
+            chat_id = int(payload.get("chat_id"))
+        except Exception:
+            raise HTTPException(status_code=400, detail="chat_id must be int")
+
+    # env fallback
+    if chat_id is None:
+        env_chat = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+        if env_chat:
+            try:
+                chat_id = int(env_chat)
+            except Exception:
+                raise HTTPException(status_code=500, detail="TELEGRAM_CHAT_ID is invalid")
+
+    # DB fallback
+    if chat_id is None and os.getenv("DATABASE_URL", "").strip():
+        try:
+            db.init_db()
+            v = (db.get_setting("telegram_chat_id") or "").strip()
+            if v:
+                chat_id = int(v)
+        except Exception:
+            pass
+
+    if chat_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail="chat_id missing (set TELEGRAM_CHAT_ID, talk to the bot once with DB enabled, or send {\"chat_id\": <int>})",
+        )
+
+    # Build and send Daily Brief text (PRD-style sections when Notion is enabled)
+    text = build_daily_brief_text(chat_id, STATE)
+
+    try:
+        send_telegram_message(chat_id=int(chat_id), text=str(text))
+        sent = 1
+        errors = 0
+    except RuntimeError:
+        # Missing token in dev/test should not be treated as an error
+        sent = 0
+        errors = 0
+    except Exception:
+        sent = 0
+        errors = 1
+
+    actions = [{"type": "reply", "chat_id": chat_id, "text": text}]
+    return {"ok": True, "sent": sent, "errors": errors, "actions": actions}

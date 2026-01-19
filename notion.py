@@ -357,34 +357,64 @@ def create_task(
     tasks_db_id: str,
     *,
     title: str,
-    status: str = "todo",
-    due: str | None = None,  # ISO date or datetime string (we store as start)
-    priority: str = "med",
+    status: str | None = None,
+    due: str | None = None,
+    priority: str | None = None,
     labels: list[str] | None = None,
-    source: str = "telegram",
     source_note_page_ids: list[str] | None = None,
+    source: str | None = None,
 ) -> str:
     """
-    Creates a Task page inside the Tasks DB.
-    Returns Notion page_id.
+    Create a task page in the given Notion Tasks database.
+
+    IMPORTANT FIX:
+      - If the database property "Status" is a Notion *Status* property, payload must be:
+          "Status": {"status": {"name": "<option>"}}
+        NOT:
+          "Status": {"select": {"name": "<option>"}}
     """
     import os
     import requests
 
-    token = (os.getenv("NOTION_TOKEN") or "").strip()
+    token = os.getenv("NOTION_TOKEN")
+    notion_version = os.getenv("NOTION_VERSION", "2022-06-28")
+
     if not token:
-        raise RuntimeError("NOTION_TOKEN is not configured")
+        raise RuntimeError("NOTION_TOKEN is not set")
 
-    notion_version = (os.getenv("NOTION_VERSION") or "2025-09-03").strip()
-    base_url = "https://api.notion.com/v1"
-
-    tasks_db_id = (tasks_db_id or "").strip()
     if not tasks_db_id:
-        raise ValueError("tasks_db_id must be non-empty")
+        raise ValueError("tasks_db_id is required")
 
-    title = (title or "").strip()
-    if not title:
-        raise ValueError("title must be non-empty")
+    if not title or not title.strip():
+        raise ValueError("title is required")
+
+    status_name = (status or "todo").strip()
+    priority_name = (priority or "med").strip()
+    source_name = (source or "telegram").strip()
+
+    props: dict = {
+        "Title": {"title": [{"type": "text", "text": {"content": title.strip()}}]},
+        # ✅ FIX: status-type property, not select-type
+        "Status": {"status": {"name": status_name}},
+        "Priority": {"select": {"name": priority_name}},
+        "Source": {"select": {"name": source_name}},
+    }
+
+    if due:
+        # Notion date expects ISO date (YYYY-MM-DD) or ISO datetime.
+        props["Due"] = {"date": {"start": due}}
+
+    if labels:
+        props["Labels"] = {"multi_select": [{"name": x} for x in labels if x and x.strip()]}
+
+    if source_note_page_ids:
+        # Assumes your DB has a relation property named "Source Notes"
+        props["Source Notes"] = {"relation": [{"id": pid} for pid in source_note_page_ids if pid]}
+
+    payload = {
+        "parent": {"database_id": tasks_db_id},
+        "properties": props,
+    }
 
     headers = {
         "Authorization": f"Bearer {token}",
@@ -392,36 +422,19 @@ def create_task(
         "Content-Type": "application/json",
     }
 
-    props: dict = {
-        "Title": {"title": [{"type": "text", "text": {"content": title}}]},
-        "Status": {"select": {"name": (status or "todo")}},
-        "Priority": {"select": {"name": (priority or "med")}},
-        "Source": {"select": {"name": (source or "telegram")}},
-    }
+    r = requests.request(
+        "POST",
+        "https://api.notion.com/v1/pages",
+        headers=headers,
+        json=payload,
+        timeout=30,
+    )
 
-    if labels:
-        props["Labels"] = {"multi_select": [{"name": l} for l in labels if str(l).strip()]}
-
-    if due:
-        props["Due"] = {"date": {"start": str(due)}}
-
-    if source_note_page_ids:
-        # Relation property created during setup: "Source Notes"
-        props["Source Notes"] = {"relation": [{"id": pid} for pid in source_note_page_ids if str(pid).strip()]}
-
-    payload = {"parent": {"database_id": tasks_db_id}, "properties": props}
-
-    r = requests.request("POST", f"{base_url}/pages", headers=headers, json=payload, timeout=20)
-    if r.status_code >= 400:
-        snippet = (r.text or "")[:500]
+    if r.status_code not in (200, 201):
+        snippet = r.text[:500] if getattr(r, "text", None) else str(r)
         raise RuntimeError(f"Notion API error {r.status_code} creating task: {snippet}")
 
-    data = r.json()
-    page_id = data.get("id")
-    if not page_id:
-        raise RuntimeError("Notion create task response missing page id")
-
-    return page_id
+    return r.json()["id"]
 
 
 def list_open_tasks(tasks_db_id: str, *, limit: int = 10) -> list[dict]:
@@ -497,7 +510,6 @@ def list_open_tasks(tasks_db_id: str, *, limit: int = 10) -> list[dict]:
 
     return out
 
-
 def mark_task_done(page_id: str) -> bool:
     """
     Sets Status=done and Completed At=now (UTC) on a task page.
@@ -528,7 +540,8 @@ def mark_task_done(page_id: str) -> bool:
 
     payload = {
         "properties": {
-            "Status": {"select": {"name": "done"}},
+            # Notion "Status" property type is `status`, NOT `select`
+            "Status": {"status": {"name": "done"}},
             "Completed At": {"date": {"start": now}},
         }
     }
@@ -539,6 +552,7 @@ def mark_task_done(page_id: str) -> bool:
         raise RuntimeError(f"Notion API error {r.status_code} marking done: {snippet}")
 
     return True
+
 
 def list_inbox_tasks(tasks_db_id: str, *, limit: int = 20) -> list[dict]:
     """

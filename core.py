@@ -7,7 +7,9 @@ import notion
 import db
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, date
+from zoneinfo import ZoneInfo
+
 from typing import Any, Dict, List, Optional
 
 
@@ -48,6 +50,163 @@ def _now_iso() -> str:
 def _next_id(state: AppState, prefix: str) -> str:
     state.seq += 1
     return f"{prefix}_{state.seq}"
+
+def build_daily_brief_text(
+    chat_id: int,
+    state: AppState,
+    *,
+    today: Optional[date] = None,
+    limit_per_section: int = 5,
+) -> str:
+    """
+    Build Daily Brief text.
+
+    - Notion enabled: sections (Overdue / Due Today / Doing / No Due)
+    - DB or in-memory fallback: Open tasks list only (no due/status metadata)
+
+    `today` is injectable for deterministic tests.
+    """
+    if not isinstance(chat_id, int):
+        raise ValueError("chat_id must be int")
+
+    if today is None:
+        today = datetime.now(ZoneInfo("Asia/Singapore")).date()
+
+    # Existing DB mode switch
+    db_enabled = bool(os.getenv("DATABASE_URL", "").strip())
+
+    # ---- Notion mode switch ----
+    notion_token = (os.getenv("NOTION_TOKEN") or "").strip()
+    notes_db_id = (os.getenv("NOTION_NOTES_DB_ID") or "").strip()
+    tasks_db_id = (os.getenv("NOTION_TASKS_DB_ID") or "").strip()
+
+    if db_enabled and (not notes_db_id or not tasks_db_id):
+        # Best-effort: load Notion IDs from Postgres settings
+        try:
+            db.init_db()
+            if not notes_db_id:
+                notes_db_id = (db.get_setting("notion_notes_db_id") or "").strip()
+            if not tasks_db_id:
+                tasks_db_id = (db.get_setting("notion_tasks_db_id") or "").strip()
+        except Exception:
+            pass
+
+    notion_enabled = bool(notion_token and notes_db_id and tasks_db_id)
+
+    def _parse_due(due_val: Any) -> Optional[date]:
+        if due_val is None:
+            return None
+        s = str(due_val).strip()
+        if not s:
+            return None
+        # tolerate "YYYY-MM-DD" or ISO datetime strings
+        s = s.split("T")[0]
+        try:
+            return date.fromisoformat(s)
+        except Exception:
+            return None
+
+    def _norm_status(v: Any) -> str:
+        s = (str(v or "todo")).strip().lower()
+        return s.replace("-", "_").replace(" ", "_")
+
+    def _fmt_task_line(t: Dict[str, Any]) -> str:
+        tid = str(t.get("id") or "").strip()
+        title = (t.get("title") or "").strip() or "(untitled)"
+        due_d = _parse_due(t.get("due"))
+        due_txt = f" (due {due_d.isoformat()})" if due_d else ""
+        return f"- {tid}: {title}{due_txt}"
+
+    def _section(title: str, items: List[Dict[str, Any]]) -> str:
+        if not items:
+            return f"{title}: 0"
+        show = items[:limit_per_section]
+        lines = [f"{title}: {len(items)}"]
+        lines.extend(_fmt_task_line(t) for t in show)
+        if len(items) > len(show):
+            lines.append(f"... (+{len(items) - len(show)} more)")
+        return "\n".join(lines)
+
+    header = f"Daily Brief ({today.isoformat()} SGT)"
+
+    # --- Notion mode: real sections ---
+    if notion_enabled:
+        tasks = notion.list_inbox_tasks(tasks_db_id, limit=50)  # open tasks with status/due
+        if not tasks:
+            return header + "\n\nNo open tasks. Go touch grass 🌱"
+
+        overdue: List[Dict[str, Any]] = []
+        due_today: List[Dict[str, Any]] = []
+        doing: List[Dict[str, Any]] = []
+        no_due: List[Dict[str, Any]] = []
+
+        for t in tasks:
+            st = _norm_status(t.get("status"))
+            if st in {"done", "completed", "complete"}:
+                continue
+
+            d = _parse_due(t.get("due"))
+
+            if st in {"doing", "in_progress", "inprogress"}:
+                doing.append(t)
+                continue
+
+            if d is None:
+                no_due.append(t)
+            elif d < today:
+                overdue.append(t)
+            elif d == today:
+                due_today.append(t)
+            else:
+                # future-dated tasks: treat as "no due" bucket for now (still open)
+                no_due.append(t)
+
+        parts = [
+            header,
+            "",
+            _section("⏰ Overdue", overdue),
+            "",
+            _section("📌 Due Today", due_today),
+            "",
+            _section("🛠️ Doing", doing),
+            "",
+            _section("📥 No Due Date / Next Up", no_due),
+        ]
+        return "\n".join(parts).strip()
+
+    # --- DB / in-memory fallback: open tasks only ---
+    if db_enabled:
+        try:
+            db.init_db()
+            open_tasks = db.list_open_tasks(chat_id, limit=20)
+        except Exception:
+            open_tasks = []
+        if not open_tasks:
+            return header + "\n\nNo open tasks. Go touch grass 🌱"
+
+        lines = [header, "", f"Open tasks: {len(open_tasks)}"]
+        lines.extend([f"- {t['id']}: {t['text']}" for t in open_tasks[:limit_per_section]])
+        if len(open_tasks) > limit_per_section:
+            lines.append(f"... (+{len(open_tasks) - limit_per_section} more)")
+        lines.append("")
+        lines.append("Tip: connect Notion to get Overdue/Due Today/Doing sections.")
+        return "\n".join(lines).strip()
+
+    # in-memory
+    state.tasks.setdefault(chat_id, [])
+    open_tasks = [t for t in state.tasks[chat_id] if not t.done]
+    if not open_tasks:
+        return header + "\n\nNo open tasks. Go touch grass 🌱"
+
+    lines = [header, "", f"Open tasks: {len(open_tasks)}"]
+    tail = open_tasks[-20:]
+    show = tail[:limit_per_section]
+    lines.extend([f"- {t.id}: {t.text}" for t in show])
+    if len(tail) > limit_per_section:
+        lines.append(f"... (+{len(tail) - limit_per_section} more)")
+    lines.append("")
+    lines.append("Tip: connect Notion to get Overdue/Due Today/Doing sections.")
+    return "\n".join(lines).strip()
 
 
 def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]:
