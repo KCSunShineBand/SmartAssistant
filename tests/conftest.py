@@ -36,3 +36,21 @@ def _clean_db_per_test():
         )
     yield
 
+NOTION_ENV_KEYS = (
+    "NOTION_TOKEN",
+    "NOTION_TASKS_DB_ID",
+    "NOTION_NOTES_DB_ID",
+    "NOTION_VERSION",
+)
+
+@pytest.fixture(autouse=True)
+def _isolate_tests_from_real_notion(monkeypatch):
+    """
+    Unit tests must never call the real Notion API.
+    Tests that need Notion env vars must set them explicitly via monkeypatch.setenv().
+    """
+    for k in NOTION_ENV_KEYS:
+        monkeypatch.delenv(k, raising=False)
+
+    # Optional: keep behavior deterministic unless a test overrides it
+    monkeypatch.setenv("APP_ENV", "test")

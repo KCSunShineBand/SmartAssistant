@@ -169,7 +169,6 @@ def _chunk_text(text: str, chunk_size: int = 1800) -> list[str]:
         return []
     return [text[i : i + chunk_size] for i in range(0, len(text), chunk_size)]
 
-
 def create_note(
     notes_db_id: str,
     *,
@@ -185,17 +184,28 @@ def create_note(
     Creates a Note page inside the Notes DB.
     Returns Notion page_id.
 
-    Stores the full note content in page blocks (children).
+    LIVE NOTES DB properties (confirmed by your API call):
+      - Title (title)
+      - Body (rich_text)
+      - Labels (multi_select)
+      - Source (select)
+      - CreatedAt (created_time)
+
+    So we MUST ONLY send: Title, Body, Labels, Source.
+    Anything else will 400 validation_error.
+
+    Also: pin Notion-Version to 2022-06-28 and sanitize token to remove CR/LF.
     """
     import os
     import requests
 
-    token = (os.getenv("NOTION_TOKEN") or "").strip()
+    raw_token = os.getenv("NOTION_TOKEN") or ""
+    token = raw_token.strip().replace("\r", "").replace("\n", "")
     if not token:
         raise RuntimeError("NOTION_TOKEN is not configured")
 
-    notion_version = (os.getenv("NOTION_VERSION") or "2025-09-03").strip()
-    base_url = "https://api.notion.com/v1"
+    # Pin version (ignore env to prevent surprises)
+    notion_version = "2022-06-28"
 
     notes_db_id = (notes_db_id or "").strip()
     if not notes_db_id:
@@ -209,51 +219,51 @@ def create_note(
     if not text:
         raise ValueError("text must be non-empty")
 
+    source_name = (source or "telegram").strip() or "telegram"
+
+    # Optionally preserve the Telegram link WITHOUT breaking schema
+    if telegram_message_link:
+        text = f"{text}\n\nTelegram: {telegram_message_link}".strip()
+
     headers = {
         "Authorization": f"Bearer {token}",
         "Notion-Version": notion_version,
         "Content-Type": "application/json",
     }
 
+    body_rich_text = [{"type": "text", "text": {"content": chunk}} for chunk in _chunk_text(text)]
+    if not body_rich_text:
+        body_rich_text = [{"type": "text", "text": {"content": text}}]
+
     props: dict = {
         "Title": {"title": [{"type": "text", "text": {"content": title}}]},
-        "Type": {"select": {"name": (note_type or "other")}},
-        "Source": {"select": {"name": (source or "telegram")}},
-        "AI Structured": {"checkbox": False},
+        "Body": {"rich_text": body_rich_text},
+        "Source": {"select": {"name": source_name}},
     }
 
-    if tags:
-        props["Tags"] = {"multi_select": [{"name": t} for t in tags if str(t).strip()]}
-
     if labels:
-        props["Labels"] = {"multi_select": [{"name": l} for l in labels if str(l).strip()]}
+        props["Labels"] = {"multi_select": [{"name": l.strip()} for l in labels if l and l.strip()]}
 
-    if telegram_message_link:
-        props["Telegram Message Link"] = {"url": str(telegram_message_link)}
+    payload = {"parent": {"database_id": notes_db_id}, "properties": props}
 
-    children = []
-    for chunk in _chunk_text(text):
-        children.append(
-            {
-                "object": "block",
-                "type": "paragraph",
-                "paragraph": {"rich_text": [{"type": "text", "text": {"content": chunk}}]},
-            }
-        )
-
-    payload = {"parent": {"database_id": notes_db_id}, "properties": props, "children": children}
-
-    r = requests.request("POST", f"{base_url}/pages", headers=headers, json=payload, timeout=20)
-    if r.status_code >= 400:
+    r = requests.request(
+        "POST",
+        "https://api.notion.com/v1/pages",
+        headers=headers,
+        json=payload,
+        timeout=30,
+    )
+    if r.status_code not in (200, 201):
         snippet = (r.text or "")[:500]
         raise RuntimeError(f"Notion API error {r.status_code} creating note: {snippet}")
 
-    data = r.json()
+    data = r.json() or {}
     page_id = data.get("id")
     if not page_id:
         raise RuntimeError("Notion create note response missing page id")
 
     return page_id
+
 
 
 def _chunk_text(text: str, chunk_size: int = 1800) -> list[str]:
@@ -266,91 +276,6 @@ def _chunk_text(text: str, chunk_size: int = 1800) -> list[str]:
         return []
     return [text[i : i + chunk_size] for i in range(0, len(text), chunk_size)]
 
-
-def create_note(
-    notes_db_id: str,
-    *,
-    title: str,
-    text: str,
-    note_type: str = "other",
-    tags: list[str] | None = None,
-    labels: list[str] | None = None,
-    source: str = "telegram",
-    telegram_message_link: str | None = None,
-) -> str:
-    """
-    Creates a Note page inside the Notes DB.
-    Returns Notion page_id.
-
-    Stores the full note content in page blocks (children).
-    """
-    import os
-    import requests
-
-    token = (os.getenv("NOTION_TOKEN") or "").strip()
-    if not token:
-        raise RuntimeError("NOTION_TOKEN is not configured")
-
-    notion_version = (os.getenv("NOTION_VERSION") or "2025-09-03").strip()
-    base_url = "https://api.notion.com/v1"
-
-    notes_db_id = (notes_db_id or "").strip()
-    if not notes_db_id:
-        raise ValueError("notes_db_id must be non-empty")
-
-    title = (title or "").strip()
-    if not title:
-        raise ValueError("title must be non-empty")
-
-    text = (text or "").strip()
-    if not text:
-        raise ValueError("text must be non-empty")
-
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Notion-Version": notion_version,
-        "Content-Type": "application/json",
-    }
-
-    props: dict = {
-        "Title": {"title": [{"type": "text", "text": {"content": title}}]},
-        "Type": {"select": {"name": (note_type or "other")}},
-        "Source": {"select": {"name": (source or "telegram")}},
-        "AI Structured": {"checkbox": False},
-    }
-
-    if tags:
-        props["Tags"] = {"multi_select": [{"name": t} for t in tags if str(t).strip()]}
-
-    if labels:
-        props["Labels"] = {"multi_select": [{"name": l} for l in labels if str(l).strip()]}
-
-    if telegram_message_link:
-        props["Telegram Message Link"] = {"url": str(telegram_message_link)}
-
-    children = []
-    for chunk in _chunk_text(text):
-        children.append(
-            {
-                "object": "block",
-                "type": "paragraph",
-                "paragraph": {"rich_text": [{"type": "text", "text": {"content": chunk}}]},
-            }
-        )
-
-    payload = {"parent": {"database_id": notes_db_id}, "properties": props, "children": children}
-
-    r = requests.request("POST", f"{base_url}/pages", headers=headers, json=payload, timeout=20)
-    if r.status_code >= 400:
-        snippet = (r.text or "")[:500]
-        raise RuntimeError(f"Notion API error {r.status_code} creating note: {snippet}")
-
-    data = r.json()
-    page_id = data.get("id")
-    if not page_id:
-        raise RuntimeError("Notion create note response missing page id")
-
-    return page_id
 
 
 def create_task(
@@ -367,21 +292,31 @@ def create_task(
     """
     Create a task page in the given Notion Tasks database.
 
-    IMPORTANT FIX:
+    IMPORTANT:
       - If the database property "Status" is a Notion *Status* property, payload must be:
           "Status": {"status": {"name": "<option>"}}
         NOT:
           "Status": {"select": {"name": "<option>"}}
+
+    ALSO IMPORTANT (Cloud Run fix):
+      - Secret Manager values sometimes include trailing newline/CRLF.
+      - requests will crash if headers contain \r or \n.
+      - So we sanitize token hard.
     """
     import os
     import requests
 
-    token = os.getenv("NOTION_TOKEN")
-    notion_version = os.getenv("NOTION_VERSION", "2022-06-28")
-
+    raw_token = os.getenv("NOTION_TOKEN") or ""
+    # strip outer whitespace + remove any embedded CR/LF just in case
+    token = raw_token.strip().replace("\r", "").replace("\n", "")
     if not token:
         raise RuntimeError("NOTION_TOKEN is not set")
 
+    notion_version = (os.getenv("NOTION_VERSION") or "2022-06-28").strip()
+    if not notion_version:
+        notion_version = "2022-06-28"
+
+    tasks_db_id = (tasks_db_id or "").strip()
     if not tasks_db_id:
         raise ValueError("tasks_db_id is required")
 
@@ -394,27 +329,21 @@ def create_task(
 
     props: dict = {
         "Title": {"title": [{"type": "text", "text": {"content": title.strip()}}]},
-        # ✅ FIX: status-type property, not select-type
-        "Status": {"status": {"name": status_name}},
+        "Status": {"status": {"name": status_name}},  # status-type, not select-type
         "Priority": {"select": {"name": priority_name}},
         "Source": {"select": {"name": source_name}},
     }
 
     if due:
-        # Notion date expects ISO date (YYYY-MM-DD) or ISO datetime.
-        props["Due"] = {"date": {"start": due}}
+        props["Due"] = {"date": {"start": str(due).strip()}}
 
     if labels:
-        props["Labels"] = {"multi_select": [{"name": x} for x in labels if x and x.strip()]}
+        props["Labels"] = {"multi_select": [{"name": x.strip()} for x in labels if x and x.strip()]}
 
     if source_note_page_ids:
-        # Assumes your DB has a relation property named "Source Notes"
         props["Source Notes"] = {"relation": [{"id": pid} for pid in source_note_page_ids if pid]}
 
-    payload = {
-        "parent": {"database_id": tasks_db_id},
-        "properties": props,
-    }
+    payload = {"parent": {"database_id": tasks_db_id}, "properties": props}
 
     headers = {
         "Authorization": f"Bearer {token}",
@@ -431,26 +360,31 @@ def create_task(
     )
 
     if r.status_code not in (200, 201):
-        snippet = r.text[:500] if getattr(r, "text", None) else str(r)
+        snippet = (r.text[:500] if getattr(r, "text", None) else str(r))
         raise RuntimeError(f"Notion API error {r.status_code} creating task: {snippet}")
 
     return r.json()["id"]
 
-
 def list_open_tasks(tasks_db_id: str, *, limit: int = 10) -> list[dict]:
     """
-    Query KC Tasks for open tasks (Status != done), sorted by Due ascending.
+    Query Tasks DB for open tasks (Status != done), sorted by Due ascending.
     Returns simplified list: [{"id": page_id, "title": "...", "status": "...", "due": "..."}]
+
+    IMPORTANT:
+      - "Status" is a Notion *status* property (not select).
+      - Pin Notion-Version to 2022-06-28 (stable DB query endpoint).
+      - Sanitize NOTION_TOKEN to remove CR/LF (Cloud Run + Secret Manager gotcha).
     """
     import os
     import requests
 
-    token = (os.getenv("NOTION_TOKEN") or "").strip()
+    raw_token = os.getenv("NOTION_TOKEN") or ""
+    token = raw_token.strip().replace("\r", "").replace("\n", "")
     if not token:
         raise RuntimeError("NOTION_TOKEN is not configured")
 
-    notion_version = (os.getenv("NOTION_VERSION") or "2025-09-03").strip()
-    base_url = "https://api.notion.com/v1"
+    # Pin version for database query API behavior
+    notion_version = "2022-06-28"
 
     tasks_db_id = (tasks_db_id or "").strip()
     if not tasks_db_id:
@@ -462,17 +396,25 @@ def list_open_tasks(tasks_db_id: str, *, limit: int = 10) -> list[dict]:
         "Content-Type": "application/json",
     }
 
+    # Be tolerant of "done" vs "Done"
     payload = {
         "page_size": int(limit),
         "filter": {
             "and": [
-                {"property": "Status", "select": {"does_not_equal": "done"}},
+                {"property": "Status", "status": {"does_not_equal": "done"}},
+                {"property": "Status", "status": {"does_not_equal": "Done"}},
             ]
         },
         "sorts": [{"property": "Due", "direction": "ascending"}],
     }
 
-    r = requests.request("POST", f"{base_url}/databases/{tasks_db_id}/query", headers=headers, json=payload, timeout=20)
+    r = requests.request(
+        "POST",
+        f"https://api.notion.com/v1/databases/{tasks_db_id}/query",
+        headers=headers,
+        json=payload,
+        timeout=30,
+    )
     if r.status_code >= 400:
         snippet = (r.text or "")[:500]
         raise RuntimeError(f"Notion API error {r.status_code} querying tasks: {snippet}")
@@ -485,6 +427,7 @@ def list_open_tasks(tasks_db_id: str, *, limit: int = 10) -> list[dict]:
         pid = page.get("id")
         props = (page.get("properties") or {})
 
+        # Title
         title = ""
         try:
             tarr = props.get("Title", {}).get("title", [])
@@ -493,12 +436,15 @@ def list_open_tasks(tasks_db_id: str, *, limit: int = 10) -> list[dict]:
         except Exception:
             title = ""
 
+        # Status (support both status and select just in case)
         status = ""
         try:
-            status = (props.get("Status", {}).get("select") or {}).get("name") or ""
+            status_obj = props.get("Status", {}) or {}
+            status = ((status_obj.get("status") or {}).get("name")) or ((status_obj.get("select") or {}).get("name")) or ""
         except Exception:
             status = ""
 
+        # Due
         due = None
         try:
             due = (props.get("Due", {}).get("date") or {}).get("start")
@@ -512,19 +458,24 @@ def list_open_tasks(tasks_db_id: str, *, limit: int = 10) -> list[dict]:
 
 def mark_task_done(page_id: str) -> bool:
     """
-    Sets Status=done and Completed At=now (UTC) on a task page.
-    Returns True if successful.
+    Sets Status=done on a task page.
+    Tries to set Completed At=now (UTC) too, but falls back if the property doesn't exist.
+
+    Hardening:
+      - sanitize NOTION_TOKEN to remove CR/LF
+      - pin Notion-Version to 2022-06-28
+      - retry once without Completed At if Notion rejects it as unknown
     """
     import os
     import requests
     from datetime import datetime, timezone
 
-    token = (os.getenv("NOTION_TOKEN") or "").strip()
+    raw_token = os.getenv("NOTION_TOKEN") or ""
+    token = raw_token.strip().replace("\r", "").replace("\n", "")
     if not token:
         raise RuntimeError("NOTION_TOKEN is not configured")
 
-    notion_version = (os.getenv("NOTION_VERSION") or "2025-09-03").strip()
-    base_url = "https://api.notion.com/v1"
+    notion_version = "2022-06-28"
 
     page_id = (page_id or "").strip()
     if not page_id:
@@ -538,20 +489,48 @@ def mark_task_done(page_id: str) -> bool:
 
     now = datetime.now(timezone.utc).isoformat()
 
-    payload = {
+    payload_with_completed_at = {
         "properties": {
-            # Notion "Status" property type is `status`, NOT `select`
             "Status": {"status": {"name": "done"}},
             "Completed At": {"date": {"start": now}},
         }
     }
 
-    r = requests.request("PATCH", f"{base_url}/pages/{page_id}", headers=headers, json=payload, timeout=20)
-    if r.status_code >= 400:
-        snippet = (r.text or "")[:500]
-        raise RuntimeError(f"Notion API error {r.status_code} marking done: {snippet}")
+    r = requests.request(
+        "PATCH",
+        f"https://api.notion.com/v1/pages/{page_id}",
+        headers=headers,
+        json=payload_with_completed_at,
+        timeout=30,
+    )
 
-    return True
+    if r.status_code in (200, 201):
+        return True
+
+    # If Completed At doesn't exist, retry without it (one retry only)
+    body = (getattr(r, "text", "") or "")[:2000]
+    if r.status_code == 400 and "Completed At" in body and "property" in body and "exists" in body:
+        payload_without_completed_at = {
+            "properties": {
+                "Status": {"status": {"name": "done"}},
+            }
+        }
+        r2 = requests.request(
+            "PATCH",
+            f"https://api.notion.com/v1/pages/{page_id}",
+            headers=headers,
+            json=payload_without_completed_at,
+            timeout=30,
+        )
+        if r2.status_code in (200, 201):
+            return True
+
+        snippet2 = (getattr(r2, "text", "") or "")[:500]
+        raise RuntimeError(f"Notion API error {r2.status_code} marking done (fallback): {snippet2}")
+
+    snippet = (getattr(r, "text", "") or "")[:500]
+    raise RuntimeError(f"Notion API error {r.status_code} marking done: {snippet}")
+
 
 
 def list_inbox_tasks(tasks_db_id: str, *, limit: int = 20) -> list[dict]:
