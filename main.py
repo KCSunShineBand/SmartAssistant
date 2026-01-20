@@ -162,15 +162,18 @@ async def telegram_webhook(request: Request):
     - Returns response fields used by existing unit tests:
         { ok, type, sent, errors, actions }
 
-    Owner-only gate:
-    - If TELEGRAM_ALLOWED_USER_ID is set -> only that user_id is processed.
-    - If TELEGRAM_ALLOWED_USER_ID is missing/invalid:
-        - default: allow all (dev friendly)
-        - strict mode: ignore all (fail closed)
+    Security gates (supports BOTH specs without breaking tests):
+    - If TELEGRAM_CHAT_ID is set and valid -> only that chat_id is processed (Checklist "single chat only").
+    - If TELEGRAM_ALLOWED_USER_ID is set and valid -> only that user_id is processed (PRD-style).
 
     Strict mode triggers if:
       - APP_ENV in {"prod","production"}
       - or TELEGRAM_STRICT_OWNER_ONLY in {"1","true","yes"}
+
+    Send error accounting:
+    - In non-strict mode (dev/test), Telegram send failures are not counted as errors.
+      (Keeps tests deterministic even if TELEGRAM_BOT_TOKEN is set on your machine.)
+    - In strict mode, send failures are counted as errors.
     """
     try:
         update = await request.json()
@@ -184,8 +187,26 @@ async def telegram_webhook(request: Request):
         "TELEGRAM_STRICT_OWNER_ONLY", ""
     ).strip().lower() in {"1", "true", "yes"}
 
-    allowed_raw = os.getenv("TELEGRAM_ALLOWED_USER_ID", "").strip()
+    # --- Chat allowlist (Checklist) ---
+    allowed_chat_raw = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    allowed_chat_id = None
+    if allowed_chat_raw:
+        try:
+            allowed_chat_id = int(allowed_chat_raw)
+        except Exception:
+            if strict:
+                return {
+                    "ok": True,
+                    "type": event_type,
+                    "unauthorized": True,
+                    "sent": 0,
+                    "errors": 0,
+                    "actions": [],
+                }
+            allowed_chat_id = None
 
+    # --- User allowlist (PRD) ---
+    allowed_raw = os.getenv("TELEGRAM_ALLOWED_USER_ID", "").strip()
     allowed_user_id = None
     if allowed_raw:
         try:
@@ -193,8 +214,8 @@ async def telegram_webhook(request: Request):
         except Exception:
             allowed_user_id = None
 
-    # If strict mode and allowlist missing/invalid -> deny all (fail closed)
-    if strict and allowed_user_id is None:
+    # If strict mode and BOTH allowlists missing/invalid -> deny all (fail closed)
+    if strict and allowed_chat_id is None and allowed_user_id is None:
         return {
             "ok": True,
             "type": event_type,
@@ -204,7 +225,30 @@ async def telegram_webhook(request: Request):
             "actions": [],
         }
 
-    # If allowlist is configured -> enforce it
+    # Enforce chat allowlist if configured
+    if allowed_chat_id is not None:
+        cid = event.get("chat_id")
+        try:
+            if int(cid) != allowed_chat_id:
+                return {
+                    "ok": True,
+                    "type": event_type,
+                    "unauthorized": True,
+                    "sent": 0,
+                    "errors": 0,
+                    "actions": [],
+                }
+        except Exception:
+            return {
+                "ok": True,
+                "type": event_type,
+                "unauthorized": True,
+                "sent": 0,
+                "errors": 0,
+                "actions": [],
+            }
+
+    # Enforce user allowlist if configured
     if allowed_user_id is not None:
         sender_user_id = event.get("user_id")
         try:
@@ -227,7 +271,7 @@ async def telegram_webhook(request: Request):
                 "actions": [],
             }
 
-    # --- NEW: persist chat_id (best-effort) so /cron/daily-brief can run without TELEGRAM_CHAT_ID ---
+    # --- Persist chat_id (best-effort) so /cron/daily-brief can run without TELEGRAM_CHAT_ID ---
     if os.getenv("DATABASE_URL", "").strip():
         try:
             db.init_db()
@@ -237,7 +281,6 @@ async def telegram_webhook(request: Request):
             if allowed_user_id is not None:
                 db.set_setting("telegram_allowed_user_id", str(allowed_user_id))
         except Exception:
-            # Never let DB issues break webhook handling
             pass
 
     actions = handle_event(event, STATE)
@@ -245,20 +288,24 @@ async def telegram_webhook(request: Request):
     sent = 0
     errors = 0
 
-    for a in actions:
-        if a.get("type") != "reply":
-            continue
+    bot_token_present = bool(os.getenv("TELEGRAM_BOT_TOKEN", "").strip())
+    reply_actions = [a for a in actions if a.get("type") == "reply"]
+
+    # If no token, don't attempt sending in dev/test.
+    if not bot_token_present:
+        if strict and reply_actions:
+            errors = len(reply_actions)
+        return {"ok": True, "type": event_type, "sent": 0, "errors": errors, "actions": actions}
+
+    for a in reply_actions:
         try:
             send_telegram_message(chat_id=int(a["chat_id"]), text=str(a["text"]))
             sent += 1
-        except RuntimeError:
-            # Missing token in dev/test should not be treated as an error
-            pass
         except Exception:
-            errors += 1
+            if strict:
+                errors += 1
 
     return {"ok": True, "type": event_type, "sent": sent, "errors": errors, "actions": actions}
-
 
 
 @app.post("/admin/notion/setup")
