@@ -102,3 +102,5 @@ def _isolate_tests_from_real_notion(monkeypatch):
 
     # Optional: keep behavior deterministic unless a test overrides it
     monkeypatch.setenv("APP_ENV", "test")
+    monkeypatch.delenv("TELEGRAM_WEBHOOK_SECRET", raising=False)
+

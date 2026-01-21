@@ -157,16 +157,41 @@ async def telegram_webhook(request: Request):
     """
     Telegram webhook endpoint.
 
-    Determinism goals:
-    - Never hang tests due to Postgres env leakage after reboot.
-    - Never depend on TELEGRAM_BOT_TOKEN being present for unit tests (tests monkeypatch sender).
-    - Only count send errors in strict/prod mode.
+    Compatibility:
+    - Returns response fields used by existing unit tests:
+        { ok, type, sent, errors, actions }
 
-    Security gates:
-    - If TELEGRAM_CHAT_ID is set -> only that chat_id is allowed (single chat mode).
-    - If TELEGRAM_ALLOWED_USER_ID is set -> only that user_id is allowed.
-    - Strict mode (prod): if BOTH gates are missing/invalid -> deny all (fail closed).
+    Webhook origin hardening (recommended):
+    - If TELEGRAM_WEBHOOK_SECRET is set, require header:
+        X-Telegram-Bot-Api-Secret-Token == TELEGRAM_WEBHOOK_SECRET
+      (This header is sent by Telegram when you setWebhook with secret_token.)
+
+    Owner-only gate:
+    - If TELEGRAM_ALLOWED_USER_ID is set -> only that user_id is processed.
+    - If TELEGRAM_ALLOWED_USER_ID is missing/invalid:
+        - default: allow all (dev friendly)
+        - strict mode: ignore all (fail closed)
+
+    Strict mode triggers if:
+      - APP_ENV in {"prod","production"}
+      - or TELEGRAM_STRICT_OWNER_ONLY in {"1","true","yes"}
     """
+
+    # --- NEW: optional Telegram webhook secret header check (cheap, before reading body) ---
+    expected_hook_secret = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
+    if expected_hook_secret:
+        got = (request.headers.get("X-Telegram-Bot-Api-Secret-Token") or "").strip()
+        if got != expected_hook_secret:
+            # Return 200 so Telegram/clients don't aggressively retry; we just do nothing.
+            return {
+                "ok": True,
+                "type": "unauthorized",
+                "unauthorized": True,
+                "sent": 0,
+                "errors": 0,
+                "actions": [],
+            }
+
     try:
         update = await request.json()
     except Exception:
@@ -179,54 +204,51 @@ async def telegram_webhook(request: Request):
         "TELEGRAM_STRICT_OWNER_ONLY", ""
     ).strip().lower() in {"1", "true", "yes"}
 
-    # Pytest sets this env var while tests run.
-    in_tests = bool(os.getenv("PYTEST_CURRENT_TEST"))
+    allowed_raw = os.getenv("TELEGRAM_ALLOWED_USER_ID", "").strip()
 
-    # --- Gate 1: chat allowlist (single chat only) ---
-    allowed_chat_raw = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-    allowed_chat_id = None
-    if allowed_chat_raw:
-        try:
-            allowed_chat_id = int(allowed_chat_raw)
-        except Exception:
-            # invalid config: fail closed only in strict
-            if strict:
-                return {"ok": True, "type": event_type, "unauthorized": True, "sent": 0, "errors": 0, "actions": []}
-            allowed_chat_id = None
-
-    # --- Gate 2: user allowlist ---
-    allowed_user_raw = os.getenv("TELEGRAM_ALLOWED_USER_ID", "").strip()
     allowed_user_id = None
-    if allowed_user_raw:
+    if allowed_raw:
         try:
-            allowed_user_id = int(allowed_user_raw)
+            allowed_user_id = int(allowed_raw)
         except Exception:
             allowed_user_id = None
 
-    # Fail closed in strict if neither gate is configured correctly
-    if strict and allowed_chat_id is None and allowed_user_id is None:
-        return {"ok": True, "type": event_type, "unauthorized": True, "sent": 0, "errors": 0, "actions": []}
+    # If strict mode and allowlist missing/invalid -> deny all (fail closed)
+    if strict and allowed_user_id is None:
+        return {
+            "ok": True,
+            "type": event_type,
+            "unauthorized": True,
+            "sent": 0,
+            "errors": 0,
+            "actions": [],
+        }
 
-    # Enforce chat gate if configured
-    if allowed_chat_id is not None:
-        cid = event.get("chat_id")
-        try:
-            if int(cid) != allowed_chat_id:
-                return {"ok": True, "type": event_type, "unauthorized": True, "sent": 0, "errors": 0, "actions": []}
-        except Exception:
-            return {"ok": True, "type": event_type, "unauthorized": True, "sent": 0, "errors": 0, "actions": []}
-
-    # Enforce user gate if configured
+    # If allowlist is configured -> enforce it
     if allowed_user_id is not None:
-        uid = event.get("user_id")
+        sender_user_id = event.get("user_id")
         try:
-            if int(uid) != allowed_user_id:
-                return {"ok": True, "type": event_type, "unauthorized": True, "sent": 0, "errors": 0, "actions": []}
+            if int(sender_user_id) != allowed_user_id:
+                return {
+                    "ok": True,
+                    "type": event_type,
+                    "unauthorized": True,
+                    "sent": 0,
+                    "errors": 0,
+                    "actions": [],
+                }
         except Exception:
-            return {"ok": True, "type": event_type, "unauthorized": True, "sent": 0, "errors": 0, "actions": []}
+            return {
+                "ok": True,
+                "type": event_type,
+                "unauthorized": True,
+                "sent": 0,
+                "errors": 0,
+                "actions": [],
+            }
 
-    # NEVER touch Postgres during pytest runs (prevents psycopg hangs if DATABASE_URL leaked in)
-    if (not in_tests) and os.getenv("DATABASE_URL", "").strip():
+    # persist chat_id best-effort
+    if os.getenv("DATABASE_URL", "").strip():
         try:
             db.init_db()
             cid = event.get("chat_id")
@@ -239,26 +261,20 @@ async def telegram_webhook(request: Request):
 
     actions = handle_event(event, STATE)
 
-    reply_actions = [a for a in actions if a.get("type") == "reply"]
     sent = 0
     errors = 0
 
-    bot_token_present = bool(os.getenv("TELEGRAM_BOT_TOKEN", "").strip())
-
-    # In strict/prod: missing token is a real config failure if we have replies to send.
-    if strict and (not bot_token_present) and reply_actions:
-        return {"ok": True, "type": event_type, "sent": 0, "errors": len(reply_actions), "actions": actions}
-
-    # Always attempt to send (even if token missing) so unit tests that monkeypatch
-    # send_telegram_message remain deterministic.
-    for a in reply_actions:
+    for a in actions:
+        if a.get("type") != "reply":
+            continue
         try:
             send_telegram_message(chat_id=int(a["chat_id"]), text=str(a["text"]))
             sent += 1
+        except RuntimeError:
+            # Missing token in dev/test should not be treated as an error
+            pass
         except Exception:
-            # Only count errors in strict mode; dev/test stays deterministic.
-            if strict:
-                errors += 1
+            errors += 1
 
     return {"ok": True, "type": event_type, "sent": sent, "errors": errors, "actions": actions}
 
