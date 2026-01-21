@@ -152,28 +152,20 @@ def debug_env(x_admin_key: Optional[str] = Header(default=None)) -> Dict[str, An
     names = sorted(os.environ.keys())
     return {"ok": True, "count": len(names), "names": names}
 
-
 @app.post("/telegram/webhook")
 async def telegram_webhook(request: Request):
     """
     Telegram webhook endpoint.
 
-    Compatibility:
-    - Returns response fields used by existing unit tests:
-        { ok, type, sent, errors, actions }
+    Determinism goals:
+    - Never hang tests due to Postgres env leakage after reboot.
+    - Never depend on TELEGRAM_BOT_TOKEN being present for unit tests (tests monkeypatch sender).
+    - Only count send errors in strict/prod mode.
 
-    Security gates (supports BOTH specs without breaking tests):
-    - If TELEGRAM_CHAT_ID is set and valid -> only that chat_id is processed (Checklist "single chat only").
-    - If TELEGRAM_ALLOWED_USER_ID is set and valid -> only that user_id is processed (PRD-style).
-
-    Strict mode triggers if:
-      - APP_ENV in {"prod","production"}
-      - or TELEGRAM_STRICT_OWNER_ONLY in {"1","true","yes"}
-
-    Send error accounting:
-    - In non-strict mode (dev/test), Telegram send failures are not counted as errors.
-      (Keeps tests deterministic even if TELEGRAM_BOT_TOKEN is set on your machine.)
-    - In strict mode, send failures are counted as errors.
+    Security gates:
+    - If TELEGRAM_CHAT_ID is set -> only that chat_id is allowed (single chat mode).
+    - If TELEGRAM_ALLOWED_USER_ID is set -> only that user_id is allowed.
+    - Strict mode (prod): if BOTH gates are missing/invalid -> deny all (fail closed).
     """
     try:
         update = await request.json()
@@ -187,92 +179,54 @@ async def telegram_webhook(request: Request):
         "TELEGRAM_STRICT_OWNER_ONLY", ""
     ).strip().lower() in {"1", "true", "yes"}
 
-    # --- Chat allowlist (Checklist) ---
+    # Pytest sets this env var while tests run.
+    in_tests = bool(os.getenv("PYTEST_CURRENT_TEST"))
+
+    # --- Gate 1: chat allowlist (single chat only) ---
     allowed_chat_raw = os.getenv("TELEGRAM_CHAT_ID", "").strip()
     allowed_chat_id = None
     if allowed_chat_raw:
         try:
             allowed_chat_id = int(allowed_chat_raw)
         except Exception:
+            # invalid config: fail closed only in strict
             if strict:
-                return {
-                    "ok": True,
-                    "type": event_type,
-                    "unauthorized": True,
-                    "sent": 0,
-                    "errors": 0,
-                    "actions": [],
-                }
+                return {"ok": True, "type": event_type, "unauthorized": True, "sent": 0, "errors": 0, "actions": []}
             allowed_chat_id = None
 
-    # --- User allowlist (PRD) ---
-    allowed_raw = os.getenv("TELEGRAM_ALLOWED_USER_ID", "").strip()
+    # --- Gate 2: user allowlist ---
+    allowed_user_raw = os.getenv("TELEGRAM_ALLOWED_USER_ID", "").strip()
     allowed_user_id = None
-    if allowed_raw:
+    if allowed_user_raw:
         try:
-            allowed_user_id = int(allowed_raw)
+            allowed_user_id = int(allowed_user_raw)
         except Exception:
             allowed_user_id = None
 
-    # If strict mode and BOTH allowlists missing/invalid -> deny all (fail closed)
+    # Fail closed in strict if neither gate is configured correctly
     if strict and allowed_chat_id is None and allowed_user_id is None:
-        return {
-            "ok": True,
-            "type": event_type,
-            "unauthorized": True,
-            "sent": 0,
-            "errors": 0,
-            "actions": [],
-        }
+        return {"ok": True, "type": event_type, "unauthorized": True, "sent": 0, "errors": 0, "actions": []}
 
-    # Enforce chat allowlist if configured
+    # Enforce chat gate if configured
     if allowed_chat_id is not None:
         cid = event.get("chat_id")
         try:
             if int(cid) != allowed_chat_id:
-                return {
-                    "ok": True,
-                    "type": event_type,
-                    "unauthorized": True,
-                    "sent": 0,
-                    "errors": 0,
-                    "actions": [],
-                }
+                return {"ok": True, "type": event_type, "unauthorized": True, "sent": 0, "errors": 0, "actions": []}
         except Exception:
-            return {
-                "ok": True,
-                "type": event_type,
-                "unauthorized": True,
-                "sent": 0,
-                "errors": 0,
-                "actions": [],
-            }
+            return {"ok": True, "type": event_type, "unauthorized": True, "sent": 0, "errors": 0, "actions": []}
 
-    # Enforce user allowlist if configured
+    # Enforce user gate if configured
     if allowed_user_id is not None:
-        sender_user_id = event.get("user_id")
+        uid = event.get("user_id")
         try:
-            if int(sender_user_id) != allowed_user_id:
-                return {
-                    "ok": True,
-                    "type": event_type,
-                    "unauthorized": True,
-                    "sent": 0,
-                    "errors": 0,
-                    "actions": [],
-                }
+            if int(uid) != allowed_user_id:
+                return {"ok": True, "type": event_type, "unauthorized": True, "sent": 0, "errors": 0, "actions": []}
         except Exception:
-            return {
-                "ok": True,
-                "type": event_type,
-                "unauthorized": True,
-                "sent": 0,
-                "errors": 0,
-                "actions": [],
-            }
+            return {"ok": True, "type": event_type, "unauthorized": True, "sent": 0, "errors": 0, "actions": []}
 
-    # --- Persist chat_id (best-effort) so /cron/daily-brief can run without TELEGRAM_CHAT_ID ---
-    if os.getenv("DATABASE_URL", "").strip():
+    # NEVER touch Postgres during pytest runs (prevents psycopg hangs if DATABASE_URL leaked in)
+    if (not in_tests) and os.getenv("DATABASE_URL", "").strip():
         try:
             db.init_db()
             cid = event.get("chat_id")
@@ -285,27 +239,30 @@ async def telegram_webhook(request: Request):
 
     actions = handle_event(event, STATE)
 
+    reply_actions = [a for a in actions if a.get("type") == "reply"]
     sent = 0
     errors = 0
 
     bot_token_present = bool(os.getenv("TELEGRAM_BOT_TOKEN", "").strip())
-    reply_actions = [a for a in actions if a.get("type") == "reply"]
 
-    # If no token, don't attempt sending in dev/test.
-    if not bot_token_present:
-        if strict and reply_actions:
-            errors = len(reply_actions)
-        return {"ok": True, "type": event_type, "sent": 0, "errors": errors, "actions": actions}
+    # In strict/prod: missing token is a real config failure if we have replies to send.
+    if strict and (not bot_token_present) and reply_actions:
+        return {"ok": True, "type": event_type, "sent": 0, "errors": len(reply_actions), "actions": actions}
 
+    # Always attempt to send (even if token missing) so unit tests that monkeypatch
+    # send_telegram_message remain deterministic.
     for a in reply_actions:
         try:
             send_telegram_message(chat_id=int(a["chat_id"]), text=str(a["text"]))
             sent += 1
         except Exception:
+            # Only count errors in strict mode; dev/test stays deterministic.
             if strict:
                 errors += 1
 
     return {"ok": True, "type": event_type, "sent": sent, "errors": errors, "actions": actions}
+
+
 
 
 @app.post("/admin/notion/setup")
