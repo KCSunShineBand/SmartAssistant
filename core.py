@@ -31,6 +31,8 @@ class Task:
     labels: List[str] = field(default_factory=list)
 
 
+from typing import Tuple  # add near other imports if not present
+
 @dataclass
 class AppState:
     """
@@ -41,6 +43,10 @@ class AppState:
     notes: Dict[int, List[Note]] = field(default_factory=dict)  # chat_id -> notes
     tasks: Dict[int, List[Task]] = field(default_factory=dict)  # chat_id -> tasks
     seq: int = 0  # simple id counter
+
+    # key: (chat_id, message_id) -> rendered list payload for later edit
+    render_cache: Dict[Tuple[int, int], Dict[str, Any]] = field(default_factory=dict)
+
 
 
 def _now_iso() -> str:
@@ -225,18 +231,40 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
     - /done <task_id>
     - /search <query>
     - plain text -> note
+    - callback actions -> mapped into the above commands (WIP)
     """
     et = event.get("type")
     chat_id = event.get("chat_id")
 
-    if et != "message" or not isinstance(chat_id, int):
+    if et not in {"message", "callback"} or not isinstance(chat_id, int):
         return []
 
-    text = (event.get("text") or "").strip()
-    route = event.get("route") or {"kind": "text", "text": text}
+    def reply(msg: str, **extra: Any) -> List[Dict[str, Any]]:
+        d: Dict[str, Any] = {"type": "reply", "chat_id": chat_id, "text": msg}
+        for k, v in (extra or {}).items():
+            if v is not None:
+                d[k] = v
+        return [d]
 
-    def reply(msg: str) -> List[Dict[str, Any]]:
-        return [{"type": "reply", "chat_id": chat_id, "text": msg}]
+    # Build route for message vs callback
+    if et == "message":
+        text = (event.get("text") or "").strip()
+        route = event.get("route") or {"kind": "text", "text": text}
+    else:
+        cb = event.get("callback") or {}
+        if cb.get("kind") == "error":
+            return reply(cb.get("message") or "Invalid action")
+
+        action = (cb.get("action") or "").strip()
+        params = cb.get("params") or {}
+
+        if action in {"today", "inbox", "help", "settings"}:
+            route = {"kind": "command", "command": action}
+        elif action == "done":
+            task_id = (params.get("task_id") or params.get("id") or "").strip()
+            route = {"kind": "command", "command": "done", "task_id": task_id}
+        else:
+            return reply(f"Unknown action: {action}")
 
     # Existing DB mode switch
     db_enabled = bool(os.getenv("DATABASE_URL", "").strip())
@@ -271,6 +299,10 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
         if len(first) <= max_len:
             return first
         return first[: max_len - 3] + "..."
+
+    def _open_in_notion_markup(page_id: str) -> Dict[str, Any]:
+        url = notion.page_url(page_id)
+        return {"inline_keyboard": [[{"text": "Open in Notion", "url": url}]]}
 
     def _save_message_map(kind: str, notion_page_id: str) -> None:
         """
@@ -314,7 +346,11 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
                     telegram_message_link=None,
                 )
                 _save_message_map("note", page_id)
-                return reply(f"Saved note (Notion): {page_id}")
+                return reply(
+                    f"Saved note (Notion): {page_id}",
+                    reply_markup=_open_in_notion_markup(page_id),
+                    disable_web_page_preview=True,
+                )
 
             if db_enabled:
                 db.init_db()
@@ -342,7 +378,11 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
                     source_note_page_ids=None,
                 )
                 _save_message_map("task", page_id)
-                return reply(f"Added task (Notion): {page_id}")
+                return reply(
+                    f"Added task (Notion): {page_id}",
+                    reply_markup=_open_in_notion_markup(page_id),
+                    disable_web_page_preview=True,
+                )
 
             if db_enabled:
                 db.init_db()
@@ -360,10 +400,49 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
                     return reply("No open tasks. Go touch grass 🌱")
 
                 lines = []
+                keyboard_rows = []
+
+                rendered_tasks = []  # for cache
+
                 for t in tasks:
-                    due = f" (due {t['due']})" if t.get("due") else ""
-                    lines.append(f"- {t['id']}: {t.get('title','').strip()}{due}")
-                return reply(f"Open tasks: {len(tasks)}\n" + "\n".join(lines))
+                    tid = t["id"]
+                    title = (t.get("title") or "").strip()
+                    due = t.get("due")
+                    status = t.get("status") or "todo"
+
+                    due_txt = f" (due {due})" if due else ""
+                    lines.append(f"- {tid}: {title}{due_txt}")
+
+                    keyboard_rows.append(
+                        [
+                            {"text": "✅ Done", "callback_data": f"done|task_id={tid}"},
+                            {"text": "Open", "url": notion.page_url(tid)},
+                        ]
+                    )
+
+                    rendered_tasks.append(
+                        {"id": tid, "title": title, "due": due, "status": status}
+                    )
+
+                text_out = f"Open tasks: {len(tasks)}\n" + "\n".join(lines)
+
+                return [
+                    {
+                        "type": "reply",
+                        "chat_id": chat_id,
+                        "text": text_out,
+                        "reply_markup": {"inline_keyboard": keyboard_rows},
+                        "disable_web_page_preview": True,
+                    },
+                    {
+                        "type": "cache_task_list",
+                        "chat_id": chat_id,
+                        "list_kind": "today",
+                        "tasks": rendered_tasks,
+                        "text": text_out,
+                    },
+                ]
+
 
             if db_enabled:
                 db.init_db()
@@ -386,12 +465,48 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
                     return reply("Inbox is empty. Suspiciously productive. 😎")
 
                 lines = []
-                for t in tasks:
-                    due = f" (due {t['due']})" if t.get("due") else ""
-                    status = t.get("status") or "todo"
-                    lines.append(f"- [{status}] {t['id']}: {t.get('title','').strip()}{due}")
+                keyboard_rows = []
+                rendered_tasks = []
 
-                return reply("Inbox (open tasks):\n" + "\n".join(lines))
+                for t in tasks:
+                    tid = t["id"]
+                    title = (t.get("title") or "").strip()
+                    due = t.get("due")
+                    status = t.get("status") or "todo"
+
+                    due_txt = f" (due {due})" if due else ""
+                    lines.append(f"- [{status}] {tid}: {title}{due_txt}")
+
+                    keyboard_rows.append(
+                        [
+                            {"text": "✅ Done", "callback_data": f"done|task_id={tid}"},
+                            {"text": "Open", "url": notion.page_url(tid)},
+                        ]
+                    )
+
+                    rendered_tasks.append(
+                        {"id": tid, "title": title, "due": due, "status": status}
+                    )
+
+                text_out = "Inbox (open tasks):\n" + "\n".join(lines)
+
+                return [
+                    {
+                        "type": "reply",
+                        "chat_id": chat_id,
+                        "text": text_out,
+                        "reply_markup": {"inline_keyboard": keyboard_rows},
+                        "disable_web_page_preview": True,
+                    },
+                    {
+                        "type": "cache_task_list",
+                        "chat_id": chat_id,
+                        "list_kind": "inbox",
+                        "tasks": rendered_tasks,
+                        "text": text_out,
+                    },
+                ]
+
 
             if db_enabled:
                 db.init_db()
@@ -407,32 +522,67 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
             preview = "\n".join([f"- {t.id}: {t.text}" for t in open_tasks[-20:]])
             return reply("Inbox (open tasks):\n" + preview)
 
-
         if cmd == "done":
             task_id = (route.get("task_id") or "").strip()
             if not task_id:
                 return reply("Missing task id. Usage: /done <task_id>")
 
+            # ---- perform the "done" operation ----
             if notion_enabled:
                 ok = notion.mark_task_done(task_id)
-                if ok:
-                    return reply(f"Marked done (Notion): {task_id}")
-                return reply(f"Task not found (Notion): {task_id}")
+                if not ok:
+                    return reply(f"Task not found (Notion): {task_id}")
+
+                # If callback, ask main.py to edit the original message (better UX)
+                if et == "callback" and isinstance(event.get("message_id"), int):
+                    return [{
+                        "type": "edit",
+                        "chat_id": chat_id,
+                        "message_id": int(event["message_id"]),
+                        "remove_task_id": task_id,
+                    }]
+
+                # Keep existing behavior for text command
+                return reply(f"Marked done (Notion): {task_id}")
 
             if db_enabled:
                 db.init_db()
                 ok = db.mark_task_done(chat_id, task_id)
-                if ok:
-                    return reply(f"Marked done: {task_id}")
-                return reply(f"Task not found (or already done): {task_id}")
+                if not ok:
+                    return reply(f"Task not found (or already done): {task_id}")
 
+                if et == "callback" and isinstance(event.get("message_id"), int):
+                    return [{
+                        "type": "edit",
+                        "chat_id": chat_id,
+                        "message_id": int(event["message_id"]),
+                        "remove_task_id": task_id,
+                    }]
+
+                return reply(f"Marked done: {task_id}")
+
+            # in-memory fallback
+            found = False
             for t in state.tasks[chat_id]:
                 if t.id == task_id:
                     if t.done:
                         return reply(f"{task_id} is already done.")
                     t.done = True
-                    return reply(f"Marked done: {task_id}")
-            return reply(f"Task not found: {task_id}")
+                    found = True
+                    break
+
+            if not found:
+                return reply(f"Task not found: {task_id}")
+
+            if et == "callback" and isinstance(event.get("message_id"), int):
+                return [{
+                    "type": "edit",
+                    "chat_id": chat_id,
+                    "message_id": int(event["message_id"]),
+                    "remove_task_id": task_id,
+                }]
+
+            return reply(f"Marked done: {task_id}")
 
 
         if cmd == "search":
@@ -486,7 +636,6 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
             return reply("\n".join(lines))
 
         if cmd == "settings":
-            # MVP parser: "/settings" or "/settings set <key> <value>"
             raw = (event.get("text") or "").strip()
             parts = raw.split()
 
@@ -508,18 +657,11 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
                 key = parts[2].strip()
                 value = " ".join(parts[3:]).strip()
 
-                allowed = {
-                    "timezone",
-                    "daily_brief_time",
-                    "privacy_mode",
-                    "ai_enabled",
-                }
+                allowed = {"timezone", "daily_brief_time", "privacy_mode", "ai_enabled"}
                 if key not in allowed:
                     return reply(f"Invalid key. Allowed: {', '.join(sorted(allowed))}")
 
-                # very light validation
                 if key == "daily_brief_time":
-                    # expect HH:MM
                     if len(value) != 5 or value[2] != ":":
                         return reply("daily_brief_time must be HH:MM (e.g., 07:30)")
                 if key == "ai_enabled":
@@ -534,10 +676,9 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
                 _set(key, value)
                 return reply(f"Updated {key} = {value}")
 
-            # Show settings
             tz = _get("timezone", "Asia/Singapore")
             brief = _get("daily_brief_time", "07:30")
-            privacy = _get("privacy_mode", "A")  # PRD: A/B
+            privacy = _get("privacy_mode", "A")
             ai_enabled = _get("ai_enabled", "true")
 
             return reply(
@@ -551,7 +692,6 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
                 "Keys: timezone, daily_brief_time, privacy_mode, ai_enabled"
             )
 
-
         if cmd == "help":
             return reply(
                 "Commands:\n"
@@ -562,15 +702,12 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
                 "/done <task_id>\n"
                 "/settings\n"
                 "/search <query>"
-
-
             )
 
         return reply(f"Command not implemented yet: /{cmd}")
-    
 
-    # Plain text -> note capture
-    if route.get("kind") == "text":
+    # Plain text -> note capture (ONLY for message events)
+    if et == "message" and route.get("kind") == "text":
         note_text = (route.get("text") or "").strip()
         if not note_text:
             return reply("Empty message")
@@ -587,7 +724,11 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
                 telegram_message_link=None,
             )
             _save_message_map("note", page_id)
-            return reply(f"Saved note (Notion): {page_id}")
+            return reply(
+                f"Saved note (Notion): {page_id}",
+                reply_markup=_open_in_notion_markup(page_id),
+                disable_web_page_preview=True,
+            )
 
         if db_enabled:
             db.init_db()
@@ -605,3 +746,4 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
         return reply(route.get("message", "Error"))
 
     return []
+

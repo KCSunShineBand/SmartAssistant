@@ -4,6 +4,54 @@ from __future__ import annotations
 import os
 from typing import Dict
 
+def page_url(page_id: str) -> str:
+    """
+    Build a Notion URL from a page_id.
+
+    Notion canonical URLs usually include a title slug + page id, but the bare
+    page id is enough to open the page in a browser.
+
+    Accepts:
+      - UUID with hyphens (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)
+      - 32-hex without hyphens
+
+    Returns:
+      https://www.notion.so/<32-hex>
+    """
+    pid = (page_id or "").strip()
+    if not pid:
+        raise ValueError("page_id must be non-empty")
+
+    # keep only hex chars, drop hyphens/garbage
+    hex_only = "".join([c for c in pid if c.lower() in "0123456789abcdef"])
+    if len(hex_only) < 32:
+        # fall back to raw (best effort) rather than hard failing
+        hex_only = pid.replace("-", "")
+    return f"https://www.notion.so/{hex_only}"
+
+def page_url(page_id: str) -> str:
+    """
+    Build a Notion URL from a page_id.
+
+    Notion accepts a bare page id (32 hex chars, no hyphens) in the URL path.
+    This is good enough for an "Open in Notion" button.
+
+    Returns:
+      https://www.notion.so/<32-hex>
+    """
+    pid = (page_id or "").strip()
+    if not pid:
+        raise ValueError("page_id must be non-empty")
+
+    # keep only hex chars, drop hyphens and anything weird
+    hex_only = "".join([c for c in pid.lower() if c in "0123456789abcdef"])
+
+    # Best-effort: if page_id isn't UUID-like, fall back to something usable
+    if len(hex_only) < 32:
+        hex_only = pid.replace("-", "")
+
+    return f"https://www.notion.so/{hex_only}"
+
 
 def setup_databases(parent_page_id: str) -> dict:
     """
@@ -277,44 +325,41 @@ def _chunk_text(text: str, chunk_size: int = 1800) -> list[str]:
     return [text[i : i + chunk_size] for i in range(0, len(text), chunk_size)]
 
 
-
 def create_task(
     tasks_db_id: str,
     *,
     title: str,
-    status: str | None = None,
+    status: str = "todo",
     due: str | None = None,
-    priority: str | None = None,
+    priority: str = "med",
     labels: list[str] | None = None,
+    source: str = "telegram",
     source_note_page_ids: list[str] | None = None,
-    source: str | None = None,
 ) -> str:
     """
-    Create a task page in the given Notion Tasks database.
+    Create a task page in the Tasks DB.
 
-    IMPORTANT:
-      - If the database property "Status" is a Notion *Status* property, payload must be:
-          "Status": {"status": {"name": "<option>"}}
-        NOT:
-          "Status": {"select": {"name": "<option>"}}
+    Resilience:
+    - Some Notion Task DBs use Status as a Notion *status* property:
+        "Status": {"status": {"name": "<option>"}}
+    - Others use Status as a *select* property:
+        "Status": {"select": {"name": "<option>"}}
 
-    ALSO IMPORTANT (Cloud Run fix):
-      - Secret Manager values sometimes include trailing newline/CRLF.
-      - requests will crash if headers contain \r or \n.
-      - So we sanitize token hard.
+    We try status-type first, then fall back to select-type on 400 validation errors.
+
+    Cloud Run gotcha:
+    - Secret Manager values can contain trailing newline/CRLF.
+    - requests will crash if headers contain \\r or \\n.
     """
     import os
     import requests
 
     raw_token = os.getenv("NOTION_TOKEN") or ""
-    # strip outer whitespace + remove any embedded CR/LF just in case
     token = raw_token.strip().replace("\r", "").replace("\n", "")
     if not token:
         raise RuntimeError("NOTION_TOKEN is not set")
 
-    notion_version = (os.getenv("NOTION_VERSION") or "2022-06-28").strip()
-    if not notion_version:
-        notion_version = "2022-06-28"
+    notion_version = (os.getenv("NOTION_VERSION") or "2022-06-28").strip() or "2022-06-28"
 
     tasks_db_id = (tasks_db_id or "").strip()
     if not tasks_db_id:
@@ -327,23 +372,22 @@ def create_task(
     priority_name = (priority or "med").strip()
     source_name = (source or "telegram").strip()
 
-    props: dict = {
+    base_props: dict = {
         "Title": {"title": [{"type": "text", "text": {"content": title.strip()}}]},
-        "Status": {"status": {"name": status_name}},  # status-type, not select-type
         "Priority": {"select": {"name": priority_name}},
         "Source": {"select": {"name": source_name}},
     }
 
     if due:
-        props["Due"] = {"date": {"start": str(due).strip()}}
+        base_props["Due"] = {"date": {"start": str(due).strip()}}
 
     if labels:
-        props["Labels"] = {"multi_select": [{"name": x.strip()} for x in labels if x and x.strip()]}
+        base_props["Labels"] = {
+            "multi_select": [{"name": x.strip()} for x in labels if x and x.strip()]
+        }
 
     if source_note_page_ids:
-        props["Source Notes"] = {"relation": [{"id": pid} for pid in source_note_page_ids if pid]}
-
-    payload = {"parent": {"database_id": tasks_db_id}, "properties": props}
+        base_props["Source Notes"] = {"relation": [{"id": pid} for pid in source_note_page_ids if pid]}
 
     headers = {
         "Authorization": f"Bearer {token}",
@@ -351,29 +395,60 @@ def create_task(
         "Content-Type": "application/json",
     }
 
-    r = requests.request(
-        "POST",
-        "https://api.notion.com/v1/pages",
-        headers=headers,
-        json=payload,
-        timeout=30,
-    )
+    def _post_with_status_kind(kind: str):
+        props = dict(base_props)
+        if kind == "status":
+            props["Status"] = {"status": {"name": status_name}}
+        else:
+            props["Status"] = {"select": {"name": status_name}}
 
-    if r.status_code not in (200, 201):
-        snippet = (r.text[:500] if getattr(r, "text", None) else str(r))
-        raise RuntimeError(f"Notion API error {r.status_code} creating task: {snippet}")
+        payload = {"parent": {"database_id": tasks_db_id}, "properties": props}
 
-    return r.json()["id"]
+        r = requests.request(
+            "POST",
+            "https://api.notion.com/v1/pages",
+            headers=headers,
+            json=payload,
+            timeout=30,
+        )
+        return r
+
+    # 1) Try status-type first (common for many live DBs)
+    r1 = _post_with_status_kind("status")
+    if r1.status_code in (200, 201):
+        return r1.json()["id"]
+
+    # 2) If validation error, try select-type fallback
+    if r1.status_code == 400:
+        r2 = _post_with_status_kind("select")
+        if r2.status_code in (200, 201):
+            return r2.json()["id"]
+
+        snippet2 = (getattr(r2, "text", "") or "")[:500]
+        snippet1 = (getattr(r1, "text", "") or "")[:500]
+        raise RuntimeError(
+            f"Notion API error creating task (status->select fallback failed). "
+            f"status_resp={r1.status_code}:{snippet1} | select_resp={r2.status_code}:{snippet2}"
+        )
+
+    snippet1 = (getattr(r1, "text", "") or "")[:500]
+    raise RuntimeError(f"Notion API error {r1.status_code} creating task: {snippet1}")
+
 
 def list_open_tasks(tasks_db_id: str, *, limit: int = 10) -> list[dict]:
     """
     Query Tasks DB for open tasks (Status != done), sorted by Due ascending.
     Returns simplified list: [{"id": page_id, "title": "...", "status": "...", "due": "..."}]
 
-    IMPORTANT:
-      - "Status" is a Notion *status* property (not select).
-      - Pin Notion-Version to 2022-06-28 (stable DB query endpoint).
-      - Sanitize NOTION_TOKEN to remove CR/LF (Cloud Run + Secret Manager gotcha).
+    Compatibility hardening:
+    - Some Notion Task DBs model Status as a Notion "status" property.
+    - Others model Status as a "select" property (as in older schemas / some PRDs).
+    - Notion will 400 if filter type doesn't match property type.
+      So we try "status" filter first, then fall back to "select" filter if we detect a mismatch.
+
+    Also:
+    - Pin Notion-Version to 2022-06-28 for stable /databases/{db_id}/query behavior.
+    - Sanitize NOTION_TOKEN to remove CR/LF (Secret Manager newline gotcha).
     """
     import os
     import requests
@@ -383,12 +458,19 @@ def list_open_tasks(tasks_db_id: str, *, limit: int = 10) -> list[dict]:
     if not token:
         raise RuntimeError("NOTION_TOKEN is not configured")
 
-    # Pin version for database query API behavior
     notion_version = "2022-06-28"
 
     tasks_db_id = (tasks_db_id or "").strip()
     if not tasks_db_id:
         raise ValueError("tasks_db_id must be non-empty")
+
+    # Normalize limit
+    try:
+        limit_i = int(limit)
+    except Exception:
+        limit_i = 10
+    if limit_i <= 0:
+        limit_i = 10
 
     headers = {
         "Authorization": f"Bearer {token}",
@@ -396,9 +478,18 @@ def list_open_tasks(tasks_db_id: str, *, limit: int = 10) -> list[dict]:
         "Content-Type": "application/json",
     }
 
-    # Be tolerant of "done" vs "Done"
-    payload = {
-        "page_size": int(limit),
+    def _do_query(payload: dict) -> requests.Response:
+        return requests.request(
+            "POST",
+            f"https://api.notion.com/v1/databases/{tasks_db_id}/query",
+            headers=headers,
+            json=payload,
+            timeout=30,
+        )
+
+    # Try Status as a Notion "status" property first
+    payload_status = {
+        "page_size": limit_i,
         "filter": {
             "and": [
                 {"property": "Status", "status": {"does_not_equal": "done"}},
@@ -408,15 +499,31 @@ def list_open_tasks(tasks_db_id: str, *, limit: int = 10) -> list[dict]:
         "sorts": [{"property": "Due", "direction": "ascending"}],
     }
 
-    r = requests.request(
-        "POST",
-        f"https://api.notion.com/v1/databases/{tasks_db_id}/query",
-        headers=headers,
-        json=payload,
-        timeout=30,
-    )
+    r = _do_query(payload_status)
+
+    # If 400 and looks like a schema/type mismatch, retry as "select"
+    if r.status_code == 400:
+        body = (getattr(r, "text", "") or "").lower()
+        looks_like_type_mismatch = (
+            "does not match filter" in body
+            or ("status" in body and "select" in body)
+            or ("property" in body and "status" in body and "filter" in body)
+        )
+        if looks_like_type_mismatch:
+            payload_select = {
+                "page_size": limit_i,
+                "filter": {
+                    "and": [
+                        {"property": "Status", "select": {"does_not_equal": "done"}},
+                        {"property": "Status", "select": {"does_not_equal": "Done"}},
+                    ]
+                },
+                "sorts": [{"property": "Due", "direction": "ascending"}],
+            }
+            r = _do_query(payload_select)
+
     if r.status_code >= 400:
-        snippet = (r.text or "")[:500]
+        snippet = (getattr(r, "text", "") or "")[:500]
         raise RuntimeError(f"Notion API error {r.status_code} querying tasks: {snippet}")
 
     data = r.json() or {}
@@ -436,11 +543,15 @@ def list_open_tasks(tasks_db_id: str, *, limit: int = 10) -> list[dict]:
         except Exception:
             title = ""
 
-        # Status (support both status and select just in case)
+        # Status (support both status and select)
         status = ""
         try:
             status_obj = props.get("Status", {}) or {}
-            status = ((status_obj.get("status") or {}).get("name")) or ((status_obj.get("select") or {}).get("name")) or ""
+            status = (
+                ((status_obj.get("status") or {}).get("name"))
+                or ((status_obj.get("select") or {}).get("name"))
+                or ""
+            )
         except Exception:
             status = ""
 
@@ -456,15 +567,23 @@ def list_open_tasks(tasks_db_id: str, *, limit: int = 10) -> list[dict]:
 
     return out
 
+
 def mark_task_done(page_id: str) -> bool:
     """
     Sets Status=done on a task page.
     Tries to set Completed At=now (UTC) too, but falls back if the property doesn't exist.
 
-    Hardening:
-      - sanitize NOTION_TOKEN to remove CR/LF
-      - pin Notion-Version to 2022-06-28
-      - retry once without Completed At if Notion rejects it as unknown
+    Compatibility hardening:
+    - Some Task DBs model Status as Notion "status"
+    - Others model Status as "select"
+    - Notion hard-fails with 400 if property type doesn't match the payload
+
+    Strategy:
+    Try these in order until one succeeds:
+      1) Status as "status" + Completed At
+      2) Status as "status" only
+      3) Status as "select" + Completed At
+      4) Status as "select" only
     """
     import os
     import requests
@@ -473,13 +592,13 @@ def mark_task_done(page_id: str) -> bool:
     raw_token = os.getenv("NOTION_TOKEN") or ""
     token = raw_token.strip().replace("\r", "").replace("\n", "")
     if not token:
-        raise RuntimeError("NOTION_TOKEN is not configured")
+        raise RuntimeError("NOTION_TOKEN is not set")
 
-    notion_version = "2022-06-28"
+    notion_version = (os.getenv("NOTION_VERSION") or "2022-06-28").strip() or "2022-06-28"
 
     page_id = (page_id or "").strip()
     if not page_id:
-        raise ValueError("page_id must be non-empty")
+        raise ValueError("page_id is required")
 
     headers = {
         "Authorization": f"Bearer {token}",
@@ -487,49 +606,50 @@ def mark_task_done(page_id: str) -> bool:
         "Content-Type": "application/json",
     }
 
-    now = datetime.now(timezone.utc).isoformat()
+    completed_at_iso = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
-    payload_with_completed_at = {
-        "properties": {
-            "Status": {"status": {"name": "done"}},
-            "Completed At": {"date": {"start": now}},
-        }
-    }
+    def _payload(status_kind: str, include_completed_at: bool) -> dict:
+        props: dict = {}
 
-    r = requests.request(
-        "PATCH",
-        f"https://api.notion.com/v1/pages/{page_id}",
-        headers=headers,
-        json=payload_with_completed_at,
-        timeout=30,
-    )
+        if status_kind == "status":
+            props["Status"] = {"status": {"name": "done"}}
+        else:
+            props["Status"] = {"select": {"name": "done"}}
 
-    if r.status_code in (200, 201):
-        return True
+        if include_completed_at:
+            # This must match the Notion property name (if it exists).
+            # If it doesn't exist, Notion 400s and we retry without it.
+            props["Completed At"] = {"date": {"start": completed_at_iso}}
 
-    # If Completed At doesn't exist, retry without it (one retry only)
-    body = (getattr(r, "text", "") or "")[:2000]
-    if r.status_code == 400 and "Completed At" in body and "property" in body and "exists" in body:
-        payload_without_completed_at = {
-            "properties": {
-                "Status": {"status": {"name": "done"}},
-            }
-        }
-        r2 = requests.request(
+        return {"properties": props}
+
+    attempts = [
+        ("status", True),
+        ("status", False),
+        ("select", True),
+        ("select", False),
+    ]
+
+    last_errors: list[str] = []
+
+    for status_kind, include_completed_at in attempts:
+        payload = _payload(status_kind, include_completed_at)
+        r = requests.request(
             "PATCH",
             f"https://api.notion.com/v1/pages/{page_id}",
             headers=headers,
-            json=payload_without_completed_at,
+            json=payload,
             timeout=30,
         )
-        if r2.status_code in (200, 201):
+
+        if r.status_code in (200, 201):
             return True
 
-        snippet2 = (getattr(r2, "text", "") or "")[:500]
-        raise RuntimeError(f"Notion API error {r2.status_code} marking done (fallback): {snippet2}")
+        snippet = (getattr(r, "text", "") or "")[:500]
+        last_errors.append(f"{status_kind}+completed={include_completed_at}: {r.status_code} {snippet}")
 
-    snippet = (getattr(r, "text", "") or "")[:500]
-    raise RuntimeError(f"Notion API error {r.status_code} marking done: {snippet}")
+    raise RuntimeError("Notion API error marking done; all fallbacks failed: " + " | ".join(last_errors))
+
 
 
 

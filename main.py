@@ -47,15 +47,105 @@ def _tg_api_url(method: str) -> str:
     return f"https://api.telegram.org/bot{token}/{method}"
 
 
+def send_telegram_message(
+    chat_id: int,
+    text: str,
+    *,
+    reply_markup: Dict[str, Any] = None,
+    parse_mode: str = None,
+    disable_web_page_preview: bool = None,
+) -> dict:
+    """
+    Send a Telegram message.
 
-def send_telegram_message(chat_id: int, text: str) -> dict:
+    `reply_markup` supports inline keyboards (buttons).
+    """
     if not isinstance(chat_id, int):
         raise ValueError("chat_id must be int")
     if not isinstance(text, str) or not text.strip():
         raise ValueError("text must be a non-empty string")
 
     url = _tg_api_url("sendMessage")
-    payload = {"chat_id": chat_id, "text": text}
+    payload: Dict[str, Any] = {"chat_id": chat_id, "text": text}
+
+    if reply_markup is not None:
+        if not isinstance(reply_markup, dict):
+            raise ValueError("reply_markup must be a dict when provided")
+        payload["reply_markup"] = reply_markup
+
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+
+    if disable_web_page_preview is not None:
+        payload["disable_web_page_preview"] = bool(disable_web_page_preview)
+
+    r = requests.post(url, json=payload, timeout=15)
+    r.raise_for_status()
+    return r.json()
+
+def edit_telegram_message(
+    chat_id: int,
+    message_id: int,
+    text: str,
+    *,
+    reply_markup: Dict[str, Any] = None,
+    parse_mode: str = None,
+    disable_web_page_preview: bool = None,
+) -> dict:
+    """
+    Edit an existing Telegram message (typically after a callback).
+    """
+    if not isinstance(chat_id, int):
+        raise ValueError("chat_id must be int")
+    if not isinstance(message_id, int):
+        raise ValueError("message_id must be int")
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("text must be non-empty string")
+
+    url = _tg_api_url("editMessageText")
+    payload: Dict[str, Any] = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+    }
+
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+
+    if parse_mode is not None:
+        payload["parse_mode"] = parse_mode
+
+    if disable_web_page_preview is not None:
+        payload["disable_web_page_preview"] = bool(disable_web_page_preview)
+
+    r = requests.post(url, json=payload, timeout=15)
+    r.raise_for_status()
+    return r.json()
+
+
+def answer_callback_query(
+    callback_id: str,
+    *,
+    text: str | None = None,
+    show_alert: bool = False,
+) -> dict:
+    """
+    Acknowledge a Telegram callback so the client stops showing the loading spinner.
+
+    Telegram method: answerCallbackQuery
+    """
+    if not isinstance(callback_id, str) or not callback_id.strip():
+        raise ValueError("callback_id must be a non-empty string")
+
+    url = _tg_api_url("answerCallbackQuery")
+    payload: Dict[str, Any] = {"callback_query_id": callback_id.strip()}
+
+    if text is not None:
+        payload["text"] = str(text)
+
+    if show_alert:
+        payload["show_alert"] = True
+
     r = requests.post(url, json=payload, timeout=15)
     r.raise_for_status()
     return r.json()
@@ -67,7 +157,8 @@ def normalize_update(update: Dict[str, Any]) -> Dict[str, Any]:
 
     Returns a dict:
       - {"type": "message", "chat_id": int|None, "user_id": int|None, "message_id": int|None, "text": str, "route": dict}
-      - {"type": "callback", "chat_id": int|None, "user_id": int|None, "data": str, "callback": dict}
+      - {"type": "callback", "chat_id": int|None, "user_id": int|None, "message_id": int|None,
+         "callback_id": str|None, "data": str, "callback": dict}
       - {"type": "unsupported", "raw_keys": [...]}
 
     Notes:
@@ -102,8 +193,11 @@ def normalize_update(update: Dict[str, Any]) -> Dict[str, Any]:
         cq = update["callback_query"]
         frm = cq.get("from") or {}
         msg = cq.get("message") or {}
-        chat = msg.get("chat") or {}
+        chat = (msg.get("chat") or {}) if isinstance(msg, dict) else {}
         data = (cq.get("data") or "").strip()
+
+        callback_id = cq.get("id")  # Telegram callback_query.id (string)
+        message_id = msg.get("message_id") if isinstance(msg, dict) else None
 
         cb = {"kind": "error", "error": "empty_callback", "message": "empty callback data"}
         if data:
@@ -119,11 +213,14 @@ def normalize_update(update: Dict[str, Any]) -> Dict[str, Any]:
             "type": "callback",
             "chat_id": int(chat_id) if chat_id is not None else None,
             "user_id": int(user_id) if user_id is not None else None,
+            "message_id": int(message_id) if message_id is not None else None,
+            "callback_id": str(callback_id) if callback_id is not None else None,
             "data": data,
             "callback": cb,
         }
 
     return {"type": "unsupported", "raw_keys": sorted(list(update.keys()))}
+
 
 
 @app.get("/health")
@@ -152,6 +249,7 @@ def debug_env(x_admin_key: Optional[str] = Header(default=None)) -> Dict[str, An
     names = sorted(os.environ.keys())
     return {"ok": True, "count": len(names), "names": names}
 
+
 @app.post("/telegram/webhook")
 async def telegram_webhook(request: Request):
     """
@@ -177,7 +275,7 @@ async def telegram_webhook(request: Request):
       - or TELEGRAM_STRICT_OWNER_ONLY in {"1","true","yes"}
     """
 
-    # --- NEW: optional Telegram webhook secret header check (cheap, before reading body) ---
+    # --- optional Telegram webhook secret header check (cheap, before reading body) ---
     expected_hook_secret = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
     if expected_hook_secret:
         got = (request.headers.get("X-Telegram-Bot-Api-Secret-Token") or "").strip()
@@ -199,6 +297,19 @@ async def telegram_webhook(request: Request):
 
     event = normalize_update(update)
     event_type = event.get("type", "unsupported")
+
+    # --- ACK callback early to stop Telegram spinner (best-effort) ---
+    if event_type == "callback":
+        cbid = event.get("callback_id")
+        if isinstance(cbid, str) and cbid.strip():
+            try:
+                answer_callback_query(cbid)
+            except RuntimeError:
+                # Missing token in dev/test -> ignore
+                pass
+            except Exception:
+                # Don't fail webhook for callback ack issues
+                pass
 
     strict = os.getenv("APP_ENV", "").lower() in {"prod", "production"} or os.getenv(
         "TELEGRAM_STRICT_OWNER_ONLY", ""
@@ -265,19 +376,161 @@ async def telegram_webhook(request: Request):
     errors = 0
 
     for a in actions:
+            # --- NEW: execute edit actions (e.g., after callback "done") ---
+        if a.get("type") == "edit":
+            try:
+                chat_id = int(a["chat_id"])
+                message_id = int(a["message_id"])
+                remove_task_id = str(a.get("remove_task_id") or "").strip()
+
+                # Try to re-render the original task list message from cache
+                cache = getattr(STATE, "render_cache", {}).get((chat_id, message_id))
+                if cache and isinstance(cache, dict):
+                    tasks = list(cache.get("tasks") or [])
+                    list_kind = cache.get("list_kind") or "tasks"
+
+                    # Remove the completed task
+                    tasks = [t for t in tasks if str(t.get("id")) != remove_task_id]
+
+                    if not tasks:
+                        # All done — replace message and remove keyboard
+                        new_text = "All done 🎉"
+                        new_markup = None
+                    else:
+                        # Rebuild text + keyboard
+                        if list_kind == "today":
+                            header = f"Open tasks: {len(tasks)}"
+                            lines = []
+                            keyboard_rows = []
+                            for t in tasks:
+                                tid = str(t.get("id") or "")
+                                title = (t.get("title") or "").strip()
+                                due = t.get("due")
+                                due_txt = f" (due {due})" if due else ""
+                                lines.append(f"- {tid}: {title}{due_txt}")
+                                keyboard_rows.append(
+                                    [
+                                        {"text": "✅ Done", "callback_data": f"done|task_id={tid}"},
+                                        {"text": "Open", "url": notion.page_url(tid)},
+                                    ]
+                                )
+                            new_text = header + "\n" + "\n".join(lines)
+                            new_markup = {"inline_keyboard": keyboard_rows}
+
+                        elif list_kind == "inbox":
+                            header = "Inbox (open tasks):"
+                            lines = []
+                            keyboard_rows = []
+                            for t in tasks:
+                                tid = str(t.get("id") or "")
+                                title = (t.get("title") or "").strip()
+                                due = t.get("due")
+                                status = t.get("status") or "todo"
+                                due_txt = f" (due {due})" if due else ""
+                                lines.append(f"- [{status}] {tid}: {title}{due_txt}")
+                                keyboard_rows.append(
+                                    [
+                                        {"text": "✅ Done", "callback_data": f"done|task_id={tid}"},
+                                        {"text": "Open", "url": notion.page_url(tid)},
+                                    ]
+                                )
+                            new_text = header + "\n" + "\n".join(lines)
+                            new_markup = {"inline_keyboard": keyboard_rows}
+                        else:
+                            # Unknown kind — fallback to simple confirmation
+                            new_text = f"✅ Done: {remove_task_id}"
+                            new_markup = None
+
+                    # Persist updated cache (or clear if empty)
+                    try:
+                        if hasattr(STATE, "render_cache"):
+                            if tasks:
+                                STATE.render_cache[(chat_id, message_id)] = {
+                                    "list_kind": list_kind,
+                                    "tasks": tasks,
+                                    "text": new_text,
+                                }
+                            else:
+                                STATE.render_cache.pop((chat_id, message_id), None)
+                    except Exception:
+                        pass
+
+                    edit_telegram_message(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text=new_text,
+                        reply_markup=new_markup,
+                        disable_web_page_preview=True,
+                    )
+                else:
+                    # No cache — fallback to simple confirmation
+                    edit_telegram_message(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text=f"✅ Done: {remove_task_id}",
+                        reply_markup=None,
+                        disable_web_page_preview=True,
+                    )
+
+            except RuntimeError:
+                # Missing token in dev/test should not be treated as an error
+                pass
+            except Exception:
+                errors += 1
+            continue
+
+        # existing reply path
         if a.get("type") != "reply":
             continue
+
+        chat_id = int(a["chat_id"])
+        text = str(a["text"])
+
+        # Only pass optional kwargs when they exist (avoid breaking old fakes/tests)
+        kwargs = {}
+        if a.get("reply_markup") is not None:
+            kwargs["reply_markup"] = a.get("reply_markup")
+        if a.get("parse_mode") is not None:
+            kwargs["parse_mode"] = a.get("parse_mode")
+        if a.get("disable_web_page_preview") is not None:
+            kwargs["disable_web_page_preview"] = a.get("disable_web_page_preview")
+
         try:
-            send_telegram_message(chat_id=int(a["chat_id"]), text=str(a["text"]))
+            try:
+                # Newer sender supports kwargs
+                resp = send_telegram_message(chat_id, text, **kwargs)
+            except TypeError:
+                # Backwards-compatible: monkeypatched send_telegram_message(chat_id, text) in tests
+                resp = send_telegram_message(chat_id, text)
+
             sent += 1
+
+            # --- NEW: store task-list render cache if core emitted it ---
+            # Look for a cache_task_list action for this chat_id in this same webhook run.
+            try:
+                result = (resp or {}).get("result") or {}
+                mid = result.get("message_id")
+                if isinstance(mid, int) and hasattr(STATE, "render_cache"):
+                    for ca in actions:
+                        if ca.get("type") == "cache_task_list" and int(ca.get("chat_id")) == chat_id:
+                            STATE.render_cache[(chat_id, mid)] = {
+                                "list_kind": ca.get("list_kind"),
+                                "tasks": ca.get("tasks") or [],
+                                "text": ca.get("text") or "",
+                            }
+                            break
+            except Exception:
+                # Never break webhook on cache issues
+                pass
+
         except RuntimeError:
             # Missing token in dev/test should not be treated as an error
             pass
         except Exception:
             errors += 1
 
-    return {"ok": True, "type": event_type, "sent": sent, "errors": errors, "actions": actions}
 
+    return {"ok": True, "type": event_type, "sent": sent, "errors": errors, "actions": actions}
 
 
 
