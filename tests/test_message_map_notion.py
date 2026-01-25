@@ -50,27 +50,23 @@ def test_notion_task_saves_message_map_when_db_enabled(monkeypatch):
     monkeypatch.setenv("DATABASE_URL", "postgresql://whatever")  # enable db_enabled path
 
     monkeypatch.setattr(core.notion, "create_task", lambda *a, **k: "task-page-999")
-
     monkeypatch.setattr(core.db, "init_db", lambda: None)
 
     saved = {}
 
-    monkeypatch.setattr(
-        core.db,
-        "save_message_map",
-        lambda message_id, kind, notion_page_id, chat_id, user_id=None: saved.update(
-            {
-                "message_id": message_id,
-                "kind": kind,
-                "notion_page_id": notion_page_id,
-                "chat_id": chat_id,
-                "user_id": user_id,
-            }
-        ),
-    )
+    def fake_save_message_map(message_id, kind, notion_page_id, chat_id, user_id=None):
+        saved["message_id"] = message_id
+        saved["kind"] = kind
+        saved["notion_page_id"] = notion_page_id
+        saved["chat_id"] = chat_id
+        saved["user_id"] = user_id
+
+    monkeypatch.setattr(core.db, "save_message_map", fake_save_message_map)
 
     st = core.AppState()
-    actions = core.handle_event(
+
+    # Step 1: /todo starts wizard; NO save yet
+    actions1 = core.handle_event(
         {
             "type": "message",
             "chat_id": 1,
@@ -81,9 +77,25 @@ def test_notion_task_saves_message_map_when_db_enabled(monkeypatch):
         },
         st,
     )
+    assert actions1 and actions1[0]["type"] == "reply"
+    assert "Send the Description" in (actions1[0].get("text") or "")
+    assert saved == {}  # nothing saved yet
 
-    assert actions[0]["type"] == "reply"
-    assert saved["message_id"] == 888
+    # Step 2: Description finalizes; save happens HERE
+    actions2 = core.handle_event(
+        {
+            "type": "message",
+            "chat_id": 1,
+            "user_id": 9,
+            "message_id": 889,
+            "text": "2 litres",
+            "route": {"kind": "text", "text": "2 litres"},
+        },
+        st,
+    )
+    assert actions2 and actions2[0]["type"] == "reply"
+
+    assert saved["message_id"] == 889
     assert saved["kind"] == "task"
     assert saved["notion_page_id"] == "task-page-999"
     assert saved["chat_id"] == 1

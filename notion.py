@@ -329,6 +329,7 @@ def create_task(
     tasks_db_id: str,
     *,
     title: str,
+    description: str | None = None,
     status: str = "todo",
     due: str | None = None,
     priority: str = "med",
@@ -378,6 +379,14 @@ def create_task(
         "Source": {"select": {"name": source_name}},
     }
 
+    # NEW: Description (rich_text)
+    if description is not None:
+        desc = str(description).strip()
+        if desc:
+            base_props["Description"] = {
+                "rich_text": [{"type": "text", "text": {"content": desc}}]
+            }
+
     if due:
         base_props["Due"] = {"date": {"start": str(due).strip()}}
 
@@ -387,7 +396,9 @@ def create_task(
         }
 
     if source_note_page_ids:
-        base_props["Source Notes"] = {"relation": [{"id": pid} for pid in source_note_page_ids if pid]}
+        base_props["Source Notes"] = {
+            "relation": [{"id": pid} for pid in source_note_page_ids if pid]
+        }
 
     headers = {
         "Authorization": f"Bearer {token}",
@@ -402,52 +413,53 @@ def create_task(
         else:
             props["Status"] = {"select": {"name": status_name}}
 
-        payload = {"parent": {"database_id": tasks_db_id}, "properties": props}
+        payload = {
+            "parent": {"database_id": tasks_db_id},
+            "properties": props,
+        }
 
-        r = requests.request(
+        return requests.request(
             "POST",
             "https://api.notion.com/v1/pages",
             headers=headers,
             json=payload,
             timeout=30,
         )
-        return r
 
-    # 1) Try status-type first (common for many live DBs)
-    r1 = _post_with_status_kind("status")
-    if r1.status_code in (200, 201):
-        return r1.json()["id"]
+    # Try Status as `status` first
+    r = _post_with_status_kind("status")
+    if r.status_code in (200, 201):
+        return (r.json() or {}).get("id") or ""
 
-    # 2) If validation error, try select-type fallback
-    if r1.status_code == 400:
+    # Fallback: Status as `select` if Notion validation complains
+    if r.status_code == 400:
         r2 = _post_with_status_kind("select")
         if r2.status_code in (200, 201):
-            return r2.json()["id"]
-
+            return (r2.json() or {}).get("id") or ""
         snippet2 = (getattr(r2, "text", "") or "")[:500]
-        snippet1 = (getattr(r1, "text", "") or "")[:500]
-        raise RuntimeError(
-            f"Notion API error creating task (status->select fallback failed). "
-            f"status_resp={r1.status_code}:{snippet1} | select_resp={r2.status_code}:{snippet2}"
-        )
+        snippet1 = (getattr(r, "text", "") or "")[:500]
+        raise RuntimeError(f"Notion create_task failed (status->select retry). {snippet1} / {snippet2}")
 
-    snippet1 = (getattr(r1, "text", "") or "")[:500]
-    raise RuntimeError(f"Notion API error {r1.status_code} creating task: {snippet1}")
+    snippet = (getattr(r, "text", "") or "")[:500]
+    raise RuntimeError(f"Notion create_task failed. HTTP {r.status_code}: {snippet}")
 
 
 def list_open_tasks(tasks_db_id: str, limit: int = 5) -> list[dict]:
     """
     Return open tasks from the Tasks DB.
 
-    Test-sensitive behavior:
-    - Must do ONLY ONE Notion API call in the "status filter works" case.
-    - First attempt uses Notion `status` filter.
-    - If Notion rejects filter type (expects select), retry with `select` filter (second call).
+    Behavior:
+    - Tries Notion `status` filter first.
+    - If Notion rejects it (expects select), retries with `select`.
+    - Extracts:
+        Title  -> "title"
+        Description (rich_text) -> "description"
+        Status -> "status"
+        Due -> "due"
 
-    Robustness:
-    - Join all Title rich_text fragments.
-    - Support Status as either `status` or `select`.
-    - Client-side filter "done-like" statuses (covers "✅ Done", "Completed", etc).
+    Backward compatibility:
+    - If Description is empty, and Title contains " | " or " : ",
+      split Title into (title, description).
     """
     import os
     import requests
@@ -494,31 +506,58 @@ def list_open_tasks(tasks_db_id: str, limit: int = 5) -> list[dict]:
     def _pick_title(props: dict) -> str:
         if not isinstance(props, dict):
             return ""
-
-        # Common: "Title"
         t = props.get("Title")
         if isinstance(t, dict):
             if "title" in t:
                 return _extract_plain_text(t.get("title"))
             if "rich_text" in t:
                 return _extract_plain_text(t.get("rich_text"))
-
-        # Sometimes: "Name"
         n = props.get("Name")
         if isinstance(n, dict):
             if "title" in n:
                 return _extract_plain_text(n.get("title"))
             if "rich_text" in n:
                 return _extract_plain_text(n.get("rich_text"))
-
-        # Fallback: any property with "title"
         for v in props.values():
             if isinstance(v, dict) and "title" in v:
                 s = _extract_plain_text(v.get("title"))
                 if s:
                     return s
-
         return ""
+
+    def _pick_description(props: dict) -> str:
+        if not isinstance(props, dict):
+            return ""
+        d = props.get("Description")
+        if not isinstance(d, dict):
+            return ""
+        # Notion DB property type "rich_text"
+        if "rich_text" in d:
+            return _extract_plain_text(d.get("rich_text"))
+        # Defensive fallback (some DBs might misuse types)
+        if "title" in d:
+            return _extract_plain_text(d.get("title"))
+        return ""
+
+    def _split_legacy_title(title: str, desc: str) -> tuple[str, str]:
+        """
+        If desc missing, attempt:
+          "Title | Description"
+          "Title : Description"
+        """
+        t = (title or "").strip()
+        d = (desc or "").strip()
+        if d:
+            return (t, d)
+
+        for sep in ["|", ":"]:
+            if sep in t:
+                left, right = t.split(sep, 1)
+                left = left.strip()
+                right = right.strip()
+                if left and right:
+                    return (left, right)
+        return (t, "")
 
     def _get_status_name(props: dict) -> str:
         if not isinstance(props, dict):
@@ -580,7 +619,6 @@ def list_open_tasks(tasks_db_id: str, limit: int = 5) -> list[dict]:
 
     r = _query(payload_status)
 
-    # If DB uses select (type mismatch), retry with select filter
     if r.status_code == 400:
         payload_select = {
             "page_size": 50,
@@ -615,7 +653,10 @@ def list_open_tasks(tasks_db_id: str, limit: int = 5) -> list[dict]:
         if not isinstance(pid, str) or not pid:
             continue
 
-        title = _pick_title(props).strip()
+        title_raw = _pick_title(props).strip()
+        desc_raw = _pick_description(props).strip()
+        title_norm, desc_norm = _split_legacy_title(title_raw, desc_raw)
+
         status_name = _get_status_name(props).strip()
         due = _get_due(props)
 
@@ -625,13 +666,146 @@ def list_open_tasks(tasks_db_id: str, limit: int = 5) -> list[dict]:
         out.append(
             {
                 "id": pid,
-                "title": title or "(untitled)",
+                "title": title_norm or "(untitled)",
+                "description": desc_norm or "",
                 "due": due,
                 "status": status_name or None,
             }
         )
 
     return out[:limit_i]
+
+def list_unique_task_titles(tasks_db_id: str, *, limit: int = 20) -> list[str]:
+    """
+    Fetch unique Titles from the Tasks DB (sorted alphabetically).
+
+    Notes:
+    - Notion doesn't support DISTINCT, so we paginate and dedupe client-side.
+    - Dedupe is case-insensitive ("Work" and "work" collapse).
+    - We do NOT filter by status: you want category reuse even if tasks are done.
+    - Stops when we collected `limit` unique non-empty titles.
+    """
+    import os
+    import requests
+
+    raw_token = os.getenv("NOTION_TOKEN") or ""
+    token = raw_token.strip().replace("\r", "").replace("\n", "")
+    if not token:
+        raise RuntimeError("NOTION_TOKEN is not set")
+
+    notion_version = (os.getenv("NOTION_VERSION") or "2022-06-28").strip() or "2022-06-28"
+
+    tasks_db_id = (tasks_db_id or "").strip()
+    if not tasks_db_id:
+        raise ValueError("tasks_db_id is required")
+
+    limit_i = int(limit or 20)
+    if limit_i < 1:
+        limit_i = 1
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Notion-Version": notion_version,
+        "Content-Type": "application/json",
+    }
+
+    def _extract_plain_text(rich_list) -> str:
+        if not isinstance(rich_list, list):
+            return ""
+        parts = []
+        for seg in rich_list:
+            if not isinstance(seg, dict):
+                continue
+            pt = seg.get("plain_text")
+            if isinstance(pt, str) and pt:
+                parts.append(pt)
+                continue
+            txt = seg.get("text") or {}
+            if isinstance(txt, dict):
+                c = txt.get("content")
+                if isinstance(c, str) and c:
+                    parts.append(c)
+        return "".join(parts).strip()
+
+    def _pick_title(props: dict) -> str:
+        if not isinstance(props, dict):
+            return ""
+        t = props.get("Title")
+        if isinstance(t, dict):
+            if "title" in t:
+                return _extract_plain_text(t.get("title"))
+            if "rich_text" in t:
+                return _extract_plain_text(t.get("rich_text"))
+        n = props.get("Name")
+        if isinstance(n, dict):
+            if "title" in n:
+                return _extract_plain_text(n.get("title"))
+            if "rich_text" in n:
+                return _extract_plain_text(n.get("rich_text"))
+        for v in props.values():
+            if isinstance(v, dict) and "title" in v:
+                s = _extract_plain_text(v.get("title"))
+                if s:
+                    return s
+        return ""
+
+    # key = casefold(title), value = first-seen original casing
+    titles_by_key: dict[str, str] = {}
+    cursor: str | None = None
+
+    for _ in range(10):  # safety cap
+        payload: dict = {"page_size": 100}
+        if cursor:
+            payload["start_cursor"] = cursor
+
+        r = requests.request(
+            "POST",
+            f"https://api.notion.com/v1/databases/{tasks_db_id}/query",
+            headers=headers,
+            json=payload,
+            timeout=30,
+        )
+        if r.status_code != 200:
+            snippet = (getattr(r, "text", "") or "")[:500]
+            raise RuntimeError(f"Notion query failed. HTTP {r.status_code}: {snippet}")
+
+        data = r.json() or {}
+        results = data.get("results") or []
+
+        for page in results:
+            if not isinstance(page, dict):
+                continue
+            props = page.get("properties") or {}
+            title = _pick_title(props).strip()
+            if not title:
+                continue
+
+            # Backward compat: if old format "Title | Desc" or "Title : Desc",
+            # keep only the left Title for dedupe
+            for sep in ["|", ":"]:
+                if sep in title:
+                    left = title.split(sep, 1)[0].strip()
+                    if left:
+                        title = left
+                    break
+
+            key = title.casefold()
+            if key and key not in titles_by_key:
+                titles_by_key[key] = title
+
+            if len(titles_by_key) >= limit_i:
+                break
+
+        if len(titles_by_key) >= limit_i:
+            break
+
+        if not data.get("has_more"):
+            break
+        cursor = data.get("next_cursor")
+
+    keys_sorted = sorted(titles_by_key.keys())
+    return [titles_by_key[k] for k in keys_sorted][:limit_i]
+
 
 
 

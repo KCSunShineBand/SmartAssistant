@@ -109,30 +109,9 @@ def route_text(text: str) -> dict:
     """
     Telegram-agnostic command router.
 
-    Input:
-      text: raw message text (may include newlines)
-
-    Output (dict):
-      - If plain text (not a /command):
-          {"kind": "text", "text": "<original trimmed text>"}
-
-      - If supported command:
-          {"kind": "command", "command": "<name>", "args": "<rest>"}
-        Plus command-specific parsed fields:
-          /note <text>     -> {"text": "<text>"}
-          /todo <text>     -> {"text": "<text>"}
-          /search <query>  -> {"query": "<query>"}
-          /done <task_id>  -> {"task_id": "<task_id>"}
-
-      - If unknown command:
-          {"kind": "unknown_command", "command": "<name>", "args": "<rest>"}
-
-      - If error (empty input or missing required args):
-          {"kind": "error", "error": "<code>", "message": "<human readable>"}
-
-    Notes:
-    - Handles Telegram-style "/cmd@BotUsername ..." by stripping "@BotUsername".
-    - Pure function: no network, no DB, no globals beyond SUPPORTED_COMMANDS.
+    NOTE (patched):
+    - /todo no longer requires args because it supports the Title-picker wizard flow.
+    - /note, /search, /done still require args.
     """
     if not isinstance(text, str):
         return {"kind": "error", "error": "invalid_input", "message": "text must be a string"}
@@ -145,8 +124,8 @@ def route_text(text: str) -> dict:
         return {"kind": "text", "text": raw}
 
     # Split: "/command rest of message"
-    first, *rest = raw.split(None, 1)  # split on any whitespace incl newlines
-    cmd_token = first[1:]  # remove leading "/"
+    first, *rest = raw.split(None, 1)
+    cmd_token = first[1:]
     if not cmd_token:
         return {"kind": "error", "error": "missing_command", "message": "missing command"}
 
@@ -154,15 +133,15 @@ def route_text(text: str) -> dict:
     cmd_name = cmd_token.split("@", 1)[0].strip().lower()
     args = rest[0].strip() if rest else ""
 
-    # Help/start aliases (optional)
+    # Help/start aliases
     if cmd_name in {"start", "help"}:
         return {"kind": "command", "command": "help", "args": args}
 
     if cmd_name not in SUPPORTED_COMMANDS:
         return {"kind": "unknown_command", "command": cmd_name, "args": args}
 
-    # Commands requiring args
-    if cmd_name in {"note", "todo", "search", "done"} and not args:
+    # Commands requiring args (PATCH: removed "todo" from this set)
+    if cmd_name in {"note", "search", "done"} and not args:
         return {
             "kind": "error",
             "error": f"missing_args_{cmd_name}",
@@ -180,3 +159,4 @@ def route_text(text: str) -> dict:
         out["task_id"] = args.split()[0]
 
     return out
+

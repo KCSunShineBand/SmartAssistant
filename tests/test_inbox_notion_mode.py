@@ -7,12 +7,14 @@ def test_inbox_uses_notion_when_configured(monkeypatch):
     monkeypatch.setenv("NOTION_TASKS_DB_ID", "tasksdb")
     monkeypatch.delenv("DATABASE_URL", raising=False)
 
+    # New UI spec: "N. Title | Description"
+    # Also: status is NOT shown in the output anymore.
     monkeypatch.setattr(
         core.notion,
         "list_inbox_tasks",
         lambda dbid, limit=20: [
-            {"id": "t1", "title": "Buy milk", "status": "todo", "due": "2026-01-20"},
-            {"id": "t2", "title": "Send invoice", "status": "doing", "due": None},
+            {"id": "t1", "title": "Buy milk", "description": "2 litres", "status": "todo", "due": "2026-01-20"},
+            {"id": "t2", "title": "Send invoice", "description": "Jan 2026", "status": "doing", "due": None},
         ],
     )
 
@@ -30,9 +32,16 @@ def test_inbox_uses_notion_when_configured(monkeypatch):
     )
 
     assert actions[0]["type"] == "reply"
-    assert "Inbox (open tasks)" in actions[0]["text"]
-    assert "Buy milk" in actions[0]["text"]
-    assert "[doing]" in actions[0]["text"]
+    txt = actions[0]["text"]
+
+    assert "Inbox (open tasks)" in txt
+    assert "1. Buy milk | 2 litres" in txt
+    assert "2. Send invoice | Jan 2026" in txt
+
+    # Old UI should NOT appear anymore
+    assert "[doing]" not in txt
+    assert "[todo]" not in txt
+
 
 
 def test_inbox_empty(monkeypatch):

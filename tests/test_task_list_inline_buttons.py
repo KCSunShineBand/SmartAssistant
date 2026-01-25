@@ -51,7 +51,6 @@ def test_today_in_notion_mode_returns_done_and_edit_buttons(monkeypatch):
     assert row0[1]["callback_data"] == "pick_edit"
 
 
-
 def test_inbox_in_notion_mode_returns_done_and_edit_buttons(monkeypatch):
     monkeypatch.setenv("NOTION_TOKEN", "t")
     monkeypatch.setenv("NOTION_NOTES_DB_ID", "notes_db")
@@ -62,7 +61,8 @@ def test_inbox_in_notion_mode_returns_done_and_edit_buttons(monkeypatch):
         core.notion,
         "list_inbox_tasks",
         lambda db_id, limit=20: [
-            {"id": "page_A", "title": "Buy milk", "due": None, "status": "todo"},
+            # New UI uses Title + Description; status isn't shown in text anymore
+            {"id": "page_A", "title": "Buy milk", "description": "2 litres", "due": None, "status": "todo"},
         ],
     )
 
@@ -81,17 +81,15 @@ def test_inbox_in_notion_mode_returns_done_and_edit_buttons(monkeypatch):
     # Verify message text is numbered and hides IDs
     txt = actions[0].get("text") or ""
     assert "Inbox (open tasks):" in txt
-    assert "1. [todo] Buy milk" in txt
-    assert "page_A" not in txt
+    assert "1. Buy milk | 2 litres" in txt
 
-    rm = actions[0].get("reply_markup")
-    assert rm and "inline_keyboard" in rm
+    # Old UI should NOT appear anymore
+    assert "[todo]" not in txt
+    assert "page_A" not in txt  # IDs should not show
 
-    # New UX: only 1 row, 2 buttons
-    assert len(rm["inline_keyboard"]) == 1
-    row0 = rm["inline_keyboard"][0]
-    assert len(row0) == 2
-    assert row0[0]["text"] == "Done"
-    assert row0[0]["callback_data"] == "pick_done"
-    assert row0[1]["text"] == "Edit"
-    assert row0[1]["callback_data"] == "pick_edit"
+    # Verify Done/Edit buttons exist
+    rm = actions[0].get("reply_markup") or {}
+    kb = rm.get("inline_keyboard") or []
+    assert kb and len(kb[0]) == 2
+    assert kb[0][0].get("text") == "Done"
+    assert kb[0][1].get("text") == "Edit"

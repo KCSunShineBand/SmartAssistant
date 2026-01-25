@@ -56,4 +56,4 @@ def test_list_open_tasks_uses_status_filter_and_parses_status(monkeypatch):
     assert all("select" not in cond for cond in f)
 
     # Response parsing
-    assert out == [{"id": "task_1", "title": "Do the thing", "status": "todo", "due": "2026-01-20"}]
+    assert out == [{"id": "task_1", "title": "Do the thing", "description": "", "status": "todo", "due": "2026-01-20"}]

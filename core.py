@@ -42,6 +42,8 @@ class AppState:
     """
     notes: Dict[int, List[Note]] = field(default_factory=dict)  # chat_id -> notes
     tasks: Dict[int, List[Task]] = field(default_factory=dict)  # chat_id -> tasks
+    todo_wizard: Dict[int, Dict[str, Any]] = field(default_factory=dict)
+
     seq: int = 0  # simple id counter
 
     # key: (chat_id, message_id) -> rendered list payload for later edit
@@ -242,6 +244,191 @@ def build_daily_brief_text(
     lines.append("Tip: connect Notion to get Overdue/Due Today/Doing sections.")
     return "\n".join(lines).strip()
 
+# chat_id -> wizard state dict (used for /todo title picker)
+todo_wizard: Dict[int, Dict[str, Any]] = field(default_factory=dict)
+
+def _handle_todo_wizard_message(
+    *,
+    chat_id: int,
+    user_text: str,
+    state: "AppState",
+    tasks_db_id: str,
+    message_id: int | None = None,
+    user_id: int | None = None,
+) -> "List[Dict[str, Any]] | None":
+    """
+    Handles the /todo wizard flow for Notion mode.
+
+    Stages:
+      - pick_title: user replies with a number OR types a title
+      - need_new_title: user types a new title after selecting 0
+      - need_desc: user types description; we create the task in Notion and finish
+
+    Also:
+      - If DATABASE_URL is set, best-effort save Telegram message -> Notion page mapping
+        using db.save_message_map with multiple signature fallbacks.
+    """
+    from typing import Any, Dict, List
+    import os
+
+    def _reply(msg: str, **extra: Any) -> List[Dict[str, Any]]:
+        d: Dict[str, Any] = {"type": "reply", "chat_id": chat_id, "text": msg}
+        for k, v in (extra or {}).items():
+            if v is not None:
+                d[k] = v
+        return [d]
+
+    def _save_message_map_best_effort(kind: str, notion_page_id: str) -> None:
+        """
+        Best-effort traceability: Telegram message -> Notion page.
+
+        Supports multiple historical db.save_message_map signatures.
+        """
+        try:
+            if not os.getenv("DATABASE_URL", "").strip():
+                return
+            if message_id is None:
+                return
+
+            db.init_db()
+
+            mid = int(message_id)
+            cid = int(chat_id)
+            uid = user_id
+
+            # 1) Preferred: (message_id, kind, notion_page_id, chat_id, user_id=None)
+            try:
+                db.save_message_map(mid, str(kind), str(notion_page_id), cid, uid)
+                return
+            except TypeError:
+                pass
+
+            # 2) Without user_id
+            try:
+                db.save_message_map(mid, str(kind), str(notion_page_id), cid)
+                return
+            except TypeError:
+                pass
+
+            # 3) Keyword variants
+            try:
+                db.save_message_map(
+                    message_id=mid,
+                    kind=str(kind),
+                    notion_page_id=str(notion_page_id),
+                    chat_id=cid,
+                    user_id=uid,
+                )
+                return
+            except TypeError:
+                pass
+
+            # 4) Older minimal variant
+            try:
+                db.save_message_map(cid, mid, str(notion_page_id))
+                return
+            except TypeError:
+                pass
+
+        except Exception:
+            return
+
+    wz = state.todo_wizard.get(chat_id)
+    if not isinstance(wz, dict):
+        return None  # no wizard active
+
+    stage = (wz.get("stage") or "").strip()
+    user_text = (user_text or "").strip()
+
+    # ---- Stage: pick title ----
+    if stage == "pick_title":
+        titles = wz.get("titles") or []
+        if not isinstance(titles, list):
+            titles = []
+
+        # numeric selection
+        if user_text.isdigit():
+            idx = int(user_text)
+
+            if idx == 0:
+                wz["stage"] = "need_new_title"
+                state.todo_wizard[chat_id] = wz
+                return _reply("Send the new Title:")
+
+            if 1 <= idx <= len(titles):
+                picked = str(titles[idx - 1]).strip()
+                if not picked:
+                    return _reply("That Title is empty. Reply with another number, or type a Title:")
+
+                wz["title"] = picked
+                wz["stage"] = "need_desc"
+                state.todo_wizard[chat_id] = wz
+                return _reply(f"Title: {picked}\nSend the Description:")
+
+            return _reply(f"Invalid selection. Reply with 0 to {len(titles)}.")
+
+        # typed title directly
+        if not user_text:
+            return _reply("Reply with a number from the list, or type a Title:")
+
+        wz["title"] = user_text
+        wz["stage"] = "need_desc"
+        state.todo_wizard[chat_id] = wz
+        return _reply(f"Title: {user_text}\nSend the Description:")
+
+    # ---- Stage: need new title ----
+    if stage == "need_new_title":
+        if not user_text:
+            return _reply("Title cannot be empty. Send the new Title:")
+
+        wz["title"] = user_text
+        wz["stage"] = "need_desc"
+        state.todo_wizard[chat_id] = wz
+        return _reply(f"Title: {user_text}\nSend the Description:")
+
+    # ---- Stage: need description ----
+    if stage == "need_desc":
+        title = (wz.get("title") or "").strip()
+        if not title:
+            state.todo_wizard.pop(chat_id, None)
+            return _reply("Something went wrong (missing title). Please run /todo again.")
+
+        if not user_text:
+            return _reply("Description cannot be empty. Send the Description:")
+
+        if not (tasks_db_id or "").strip():
+            state.todo_wizard.pop(chat_id, None)
+            return _reply("Notion Tasks DB is not configured. (Missing NOTION_TASKS_DB_ID)")
+
+        # Create task NOW and finish the wizard
+        page_id = notion.create_task(
+            (tasks_db_id or "").strip(),
+            title=title,
+            description=user_text,
+            status="todo",
+            due=None,
+            priority="med",
+            labels=[],
+            source="telegram",
+            source_note_page_ids=None,
+        )
+
+        # Save message map (best-effort) using the DESCRIPTION message_id
+        _save_message_map_best_effort("task", page_id)
+
+        state.todo_wizard.pop(chat_id, None)
+
+        rm = {"inline_keyboard": [[{"text": "Open in Notion", "url": notion.page_url(page_id)}]]}
+        return _reply(
+            f"Added: {title} | {user_text}",
+            reply_markup=rm,
+            disable_web_page_preview=True,
+        )
+
+    # Unknown stage -> reset
+    state.todo_wizard.pop(chat_id, None)
+    return _reply("Todo flow reset. Please run /todo again.")
+
 
 
 def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]:
@@ -296,6 +483,25 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
         else:
             return reply(f"Unknown action: {action}")
 
+    # If a /todo wizard is active, consume plain-text replies as wizard input
+    if et == "message":
+        # If user sends a new command while wizard is active, cancel the wizard (except /todo)
+        if (route.get("kind") == "command") and (route.get("command") != "todo"):
+            state.todo_wizard.pop(chat_id, None)
+        elif route.get("kind") == "text":
+            maybe = _handle_todo_wizard_message(
+                chat_id=chat_id,
+                user_text=(route.get("text") or ""),
+                state=state,
+                tasks_db_id=(os.getenv("NOTION_TASKS_DB_ID") or "").strip(),
+                message_id=event.get("message_id"),
+                user_id=event.get("user_id"),
+            )
+
+            if maybe is not None:
+                return maybe
+
+
     # Existing DB mode switch
     db_enabled = bool(os.getenv("DATABASE_URL", "").strip())
 
@@ -344,6 +550,82 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
                 ]
             ]
         }
+
+    def _render_and_group_tasks(tasks: list[dict], *, include_status: bool) -> tuple[str, list[dict]]:
+        """
+        Render tasks into numbered lines and return:
+        (rendered_text, rendered_tasks_for_cache)
+
+        Rules:
+        - Display format: "N. Title | Description" (+ due if present)
+        - Group by Title (case-insensitive)
+        - Within a Title group, sort by Description (case-insensitive), then due (None last)
+        - Never include Notion IDs in the text
+        """
+        def _ci(s: str) -> str:
+            return (s or "").strip().lower()
+
+        def _due_key(due: str | None) -> tuple[int, str]:
+            # None last
+            if not due:
+                return (1, "")
+            return (0, str(due))
+
+        normalized: list[dict] = []
+        for idx, t in enumerate(tasks):
+            title = (t.get("title") or "").strip()
+            desc = (t.get("description") or "").strip()
+            status = (t.get("status") or "todo").strip()
+            due = t.get("due")
+            tid = t.get("id")
+
+            normalized.append(
+                {
+                    "_orig": idx,
+                    "id": tid,
+                    "title": title,
+                    "description": desc,
+                    "status": status,
+                    "due": due,
+                }
+            )
+
+        normalized.sort(
+            key=lambda x: (
+                _ci(x["title"]),
+                _ci(x["description"]),
+                _due_key(x["due"]),
+                x["_orig"],
+            )
+        )
+
+        lines: list[str] = []
+        rendered_tasks: list[dict] = []
+
+        for i, t in enumerate(normalized, start=1):
+            title = t["title"]
+            desc = t["description"]
+            status = t["status"]
+            due = t["due"]
+
+            due_txt = f" (due {due})" if due else ""
+
+            if include_status:
+                # If you still want status in inbox, we can keep it — but your latest spec didn’t ask for it.
+                # Recommendation: remove status from display for consistency.
+                line = f"{i}. {title} | {desc}{due_txt}"
+            else:
+                line = f"{i}. {title} | {desc}{due_txt}"
+
+            lines.append(line)
+
+            rendered_tasks.append(
+                {"id": t["id"], "title": title, "description": desc, "due": due, "status": status}
+            )
+
+        text_body = "\n".join(lines)
+        return text_body, rendered_tasks
+
 
     def _save_message_map(kind: str, notion_page_id: str) -> None:
         """
@@ -398,6 +680,8 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
 
         except Exception:
             return
+
+
 
 
     # --- NEW: Multi-step UX handling for Done/Edit via item number ---
@@ -587,58 +871,152 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
             return reply(f"Saved note: {nid}")
 
         if cmd == "todo":
-            task_text = (route.get("text") or "").strip()
-            if not task_text:
-                return reply("Missing text. Usage: /todo <text>")
+            raw = (route.get("text") or route.get("args") or "").strip()
 
+            # ---- Notion mode: Title picker wizard + Description field ----
             if notion_enabled:
-                page_id = notion.create_task(
-                    tasks_db_id,
-                    title=task_text,
-                    status="todo",
-                    due=None,
-                    priority="med",
-                    labels=[],
-                    source="telegram",
-                    source_note_page_ids=None,
-                )
-                _save_message_map("task", page_id)
-                return reply(
-                    f"Added task (Notion): {page_id}",
-                    reply_markup=_open_in_notion_markup(page_id),
-                    disable_web_page_preview=True,
-                )
+                # Power user mode: "/todo Title | Description"
+                if "|" in raw:
+                    left, right = raw.split("|", 1)
+                    title = left.strip()
+                    desc = right.strip()
+                    if not title or not desc:
+                        return reply("Format: /todo Title | Description (both parts required)")
+
+                    page_id = notion.create_task(
+                        tasks_db_id,
+                        title=title,
+                        description=desc,
+                        status="todo",
+                        due=None,
+                        priority="med",
+                        labels=[],
+                        source="telegram",
+                        source_note_page_ids=None,
+                    )
+                    _save_message_map("task", page_id)
+                    return reply(
+                        f"Added: {title} | {desc}",
+                        reply_markup=_open_in_notion_markup(page_id),
+                        disable_web_page_preview=True,
+                    )
+
+                # If user typed something after /todo without "|", treat it as a Title and ask for Description
+                if raw:
+                    state.todo_wizard[chat_id] = {"stage": "need_desc", "title": raw}
+                    return reply(f"Title: {raw}\nSend the Description:")
+
+                # Wizard start: show unique titles (limit 20) + 0 for new title
+                titles = notion.list_unique_task_titles(tasks_db_id, limit=20)
+
+                lines = ["Pick a Title (reply with number, or type a Title):", "0. New Title"]
+                for i, t in enumerate(titles, start=1):
+                    lines.append(f"{i}. {t}")
+
+                menu_text = "\n".join(lines)
+
+                state.todo_wizard[chat_id] = {
+                    "stage": "pick_title",
+                    "titles": titles,
+                    "menu_text": menu_text,
+                }
+
+                return reply(menu_text)
+
+            # ---- Non-Notion fallback (DB or in-memory) ----
+            if not raw:
+                return reply("Missing text. Usage: /todo <text>")
 
             if db_enabled:
                 db.init_db()
-                tid = db.create_task(chat_id, task_text)
+                tid = db.create_task(chat_id, raw)
                 return reply(f"Added task: {tid}")
 
             tid = _next_id(state, "task")
-            state.tasks[chat_id].append(Task(id=tid, text=task_text, created_at=_now_iso()))
+            state.tasks[chat_id].append(Task(id=tid, text=raw, created_at=_now_iso()))
             return reply(f"Added task: {tid}")
 
+
         if cmd == "today":
+            # --- Notion mode ---
             if notion_enabled:
                 tasks = notion.list_open_tasks(tasks_db_id, limit=5)
                 if not tasks:
                     return reply("No open tasks. Go touch grass 🌱")
 
-                lines = []
-                rendered_tasks = []
+                def _norm(s: str) -> str:
+                    return (s or "").strip().lower()
 
-                for i, t in enumerate(tasks, start=1):
-                    tid = t["id"]
+                # Group by Title (case-insensitive), then sort within group by Description
+                buckets: dict[str, list[dict]] = {}
+                title_variants: dict[str, list[str]] = {}
+
+                for t in (tasks or []):
+                    title_raw = (t.get("title") or "").strip()
+                    desc_raw = (t.get("description") or "").strip()
+                    key = _norm(title_raw)
+
+                    buckets.setdefault(key, []).append(
+                        {
+                            "id": t.get("id"),
+                            "title": title_raw,
+                            "description": desc_raw,
+                            "due": t.get("due"),
+                            "status": t.get("status") or "todo",
+                        }
+                    )
+                    if title_raw:
+                        title_variants.setdefault(key, []).append(title_raw)
+
+                def _pick_canonical_title(variants: list[str]) -> str:
+                    # Prefer Titlecase-ish, else starts-with-uppercase, else first.
+                    vs = [v.strip() for v in (variants or []) if v and v.strip()]
+                    if not vs:
+                        return ""
+                    # exact Titlecase (first upper, rest lower)
+                    for v in vs:
+                        if len(v) >= 2 and v[:1].isupper() and v[1:] == v[1:].lower():
+                            return v
+                        if len(v) == 1 and v.isupper():
+                            return v
+                    # starts with uppercase
+                    for v in vs:
+                        if v[:1].isupper():
+                            return v
+                    return vs[0]
+
+                flattened: list[dict] = []
+                for title_key in sorted(buckets.keys()):
+                    group = buckets[title_key]
+                    group.sort(key=lambda x: (_norm(x.get("description") or ""), _norm(x.get("status") or "")))
+
+                    canon = _pick_canonical_title(title_variants.get(title_key, [])) or (group[0].get("title") or "")
+                    for g in group:
+                        g["title"] = canon or g.get("title") or ""
+                        flattened.append(g)
+
+                lines: list[str] = []
+                rendered_tasks: list[dict] = []
+
+                for i, t in enumerate(flattened, start=1):
+                    tid = (t.get("id") or "").strip()
                     title = (t.get("title") or "").strip()
-                    due = t.get("due")
-                    status = t.get("status") or "todo"
+                    desc = (t.get("description") or "").strip()
 
-                    due_txt = f" (due {due})" if due else ""
-                    lines.append(f"{i}. {title}{due_txt}")
+                    # Always show Title | Description (Description may be blank for legacy tasks)
+                    lines.append(f"{i}. {title} | {desc}".rstrip())
 
-                    rendered_tasks.append({"id": tid, "title": title, "due": due, "status": status})
+                    rendered_tasks.append(
+                        {
+                            "id": tid,
+                            "title": title,
+                            "description": desc,
+                            "due": t.get("due"),
+                            "status": t.get("status") or "todo",
+                        }
+                    )
 
-                text_out = f"Open tasks: {len(tasks)}\n" + "\n".join(lines)
+                text_out = f"Open tasks: {len(flattened)}\n" + "\n".join(lines)
 
                 return [
                     {
@@ -657,6 +1035,7 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
                     },
                 ]
 
+            # --- Postgres DB mode ---
             if db_enabled:
                 db.init_db()
                 open_tasks = db.list_open_tasks(chat_id, limit=5)
@@ -665,11 +1044,14 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
                 preview = "\n".join([f"- {t['id']}: {t['text']}" for t in open_tasks])
                 return reply(f"Open tasks: {len(open_tasks)}\n{preview}")
 
-            open_tasks = [t for t in state.tasks[chat_id] if not t.done]
+            # --- In-memory fallback (this is what your failing test needs) ---
+            open_tasks = [t for t in state.tasks[chat_id] if not getattr(t, "done", False)]
             if not open_tasks:
                 return reply("No open tasks. Go touch grass 🌱")
+
             preview = "\n".join([f"- {t.id}: {t.text}" for t in open_tasks[-5:]])
             return reply(f"Open tasks: {len(open_tasks)}\n{preview}")
+
 
         if cmd == "inbox":
             if notion_enabled:
@@ -677,18 +1059,78 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
                 if not tasks:
                     return reply("Inbox is empty. Suspiciously productive. 😎")
 
-                lines = []
-                rendered_tasks = []
+                def _norm(s: str) -> str:
+                    return (s or "").strip().lower()
 
-                for i, t in enumerate(tasks, start=1):
-                    tid = t["id"]
+                def _desc_or_dash(s: str) -> str:
+                    s2 = (s or "").strip()
+                    return s2 if s2 else "—"
+
+                # Group by Title (case-insensitive), then sort within group by Description
+                buckets: dict[str, list[dict]] = {}
+                title_variants: dict[str, list[str]] = {}
+
+                for t in (tasks or []):
+                    title_raw = (t.get("title") or "").strip()
+                    desc_raw = (t.get("description") or "").strip()
+                    key = _norm(title_raw)
+
+                    buckets.setdefault(key, []).append(
+                        {
+                            "id": (t.get("id") or "").strip(),
+                            "title": title_raw,
+                            "description": desc_raw,
+                            "due": t.get("due"),
+                            "status": t.get("status") or "todo",
+                        }
+                    )
+                    if title_raw:
+                        title_variants.setdefault(key, []).append(title_raw)
+
+                def _pick_canonical_title(variants: list[str]) -> str:
+                    vs = [v.strip() for v in (variants or []) if v and v.strip()]
+                    if not vs:
+                        return ""
+                    # Prefer "Work" over "work"
+                    for v in vs:
+                        if len(v) >= 2 and v[:1].isupper() and v[1:] == v[1:].lower():
+                            return v
+                        if len(v) == 1 and v.isupper():
+                            return v
+                    for v in vs:
+                        if v[:1].isupper():
+                            return v
+                    return vs[0]
+
+                flattened: list[dict] = []
+                for title_key in sorted(buckets.keys()):
+                    group = buckets[title_key]
+                    group.sort(key=lambda x: (_norm(x.get("description") or ""), _norm(x.get("status") or "")))
+
+                    canon = _pick_canonical_title(title_variants.get(title_key, [])) or (group[0].get("title") or "")
+                    for g in group:
+                        g["title"] = canon or g.get("title") or ""
+                        flattened.append(g)
+
+                lines: list[str] = []
+                rendered_tasks: list[dict] = []
+
+                for i, t in enumerate(flattened, start=1):
+                    tid = (t.get("id") or "").strip()
                     title = (t.get("title") or "").strip()
-                    due = t.get("due")
-                    status = t.get("status") or "todo"
-                    due_txt = f" (due {due})" if due else ""
-                    lines.append(f"{i}. [{status}] {title}{due_txt}")
+                    desc = _desc_or_dash(t.get("description") or "")
 
-                    rendered_tasks.append({"id": tid, "title": title, "due": due, "status": status})
+                    lines.append(f"{i}. {title} | {desc}")
+
+                    rendered_tasks.append(
+                        {
+                            "id": tid,
+                            "title": title,
+                            "description": (t.get("description") or "").strip(),
+                            "due": t.get("due"),
+                            "status": t.get("status") or "todo",
+                        }
+                    )
 
                 text_out = "Inbox (open tasks):\n" + "\n".join(lines)
 
@@ -709,6 +1151,7 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
                     },
                 ]
 
+            # --- Postgres DB mode ---
             if db_enabled:
                 db.init_db()
                 open_tasks = db.list_open_tasks(chat_id, limit=20)
@@ -717,11 +1160,14 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
                 preview = "\n".join([f"- {t['id']}: {t['text']}" for t in open_tasks])
                 return reply("Inbox (open tasks):\n" + preview)
 
+            # --- In-memory fallback ---
             open_tasks = [t for t in state.tasks[chat_id] if not t.done]
             if not open_tasks:
                 return reply("Inbox is empty. Suspiciously productive. 😎")
             preview = "\n".join([f"- {t.id}: {t.text}" for t in open_tasks[-20:]])
             return reply("Inbox (open tasks):\n" + preview)
+
+
 
         if cmd == "done":
             task_id = (route.get("task_id") or "").strip()

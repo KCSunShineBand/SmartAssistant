@@ -55,7 +55,7 @@ def test_list_open_tasks_falls_back_to_select_filter(monkeypatch):
     out = notion.list_open_tasks("db_123", limit=10)
 
     assert len(calls) == 2
-    assert out == [{"id": "page_1", "title": "Pay rent", "status": "todo", "due": "2026-01-21"}]
+    assert out == [{"id": "page_1", "title": "Pay rent", "description": "", "status": "todo", "due": "2026-01-21"}]
 
 
 def test_list_open_tasks_uses_status_filter_when_supported(monkeypatch):
@@ -90,4 +90,5 @@ def test_list_open_tasks_uses_status_filter_when_supported(monkeypatch):
     f0 = calls[0]["filter"]["and"][0]
     assert f0["property"] == "Status"
     assert "status" in f0
-    assert out == [{"id": "page_2", "title": "Write report", "status": "doing", "due": None}]
+    assert out == [{"id": "page_2", "title": "Write report", "description": "", "status": "doing", "due": None}]
+
