@@ -947,6 +947,10 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
                 def _norm(s: str) -> str:
                     return (s or "").strip().lower()
 
+                def _desc_or_dash(s: str) -> str:
+                    s2 = (s or "").strip()
+                    return s2 if s2 else "—"
+
                 # Group by Title (case-insensitive), then sort within group by Description
                 buckets: dict[str, list[dict]] = {}
                 title_variants: dict[str, list[str]] = {}
@@ -969,7 +973,6 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
                         title_variants.setdefault(key, []).append(title_raw)
 
                 def _pick_canonical_title(variants: list[str]) -> str:
-                    # Prefer Titlecase-ish, else starts-with-uppercase, else first.
                     vs = [v.strip() for v in (variants or []) if v and v.strip()]
                     if not vs:
                         return ""
@@ -989,7 +992,6 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
                 for title_key in sorted(buckets.keys()):
                     group = buckets[title_key]
                     group.sort(key=lambda x: (_norm(x.get("description") or ""), _norm(x.get("status") or "")))
-
                     canon = _pick_canonical_title(title_variants.get(title_key, [])) or (group[0].get("title") or "")
                     for g in group:
                         g["title"] = canon or g.get("title") or ""
@@ -1001,16 +1003,17 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
                 for i, t in enumerate(flattened, start=1):
                     tid = (t.get("id") or "").strip()
                     title = (t.get("title") or "").strip()
-                    desc = (t.get("description") or "").strip()
 
-                    # Always show Title | Description (Description may be blank for legacy tasks)
-                    lines.append(f"{i}. {title} | {desc}".rstrip())
+                    desc_raw = (t.get("description") or "").strip()
+                    desc_disp = _desc_or_dash(desc_raw)
+
+                    lines.append(f"{i}. {title} | {desc_disp}")
 
                     rendered_tasks.append(
                         {
                             "id": tid,
                             "title": title,
-                            "description": desc,
+                            "description": desc_raw,  # keep raw for edits
                             "due": t.get("due"),
                             "status": t.get("status") or "todo",
                         }
