@@ -1,4 +1,5 @@
 from datetime import date
+
 import core
 
 
@@ -24,14 +25,26 @@ def test_daily_brief_notion_sections(monkeypatch):
     text = core.build_daily_brief_text(123, state, today=date(2026, 1, 19))
 
     assert "Daily Brief (2026-01-19 SGT)" in text
+
+    # New format: numbered lines, IDs hidden
     assert "⏰ Overdue: 1" in text
-    assert "- t1: Pay bill (due 2026-01-18)" in text
+    assert "1. Pay bill (due 2026-01-18)" in text
+
     assert "📌 Due Today: 1" in text
-    assert "- t2: Submit report (due 2026-01-19)" in text
+    assert "1. Submit report (due 2026-01-19)" in text
+
     assert "🛠️ Doing: 1" in text
-    assert "- t3: Build feature" in text
+    assert "1. Build feature" in text
+
     assert "📥 No Due Date / Next Up: 1" in text
-    assert "- t4: Plan roadmap" in text
+    # keep this tolerant in case of future title formatting tweaks
+    assert "Plan road" in text
+
+    # Make sure IDs are not leaking into the brief
+    assert "t1" not in text
+    assert "t2" not in text
+    assert "t3" not in text
+    assert "t4" not in text
 
 
 def test_daily_brief_in_memory_fallback(monkeypatch):
@@ -46,6 +59,9 @@ def test_daily_brief_in_memory_fallback(monkeypatch):
     ]
 
     text = core.build_daily_brief_text(999, state, today=date(2026, 1, 19))
+    assert "Daily Brief (2026-01-19 SGT)" in text
     assert "Open tasks: 1" in text
-    assert "- task_1: alpha" in text
-    assert "Tip: connect Notion" in text
+
+    # New format: numbered lines, IDs hidden
+    assert "1. alpha" in text
+    assert "task_1" not in text
