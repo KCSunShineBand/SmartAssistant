@@ -116,21 +116,33 @@ def build_daily_brief_text(
         s = (str(v or "todo")).strip().lower()
         return s.replace("-", "_").replace(" ", "_")
 
-    def _fmt_task_line(t: Dict[str, Any]) -> str:
-        tid = str(t.get("id") or "").strip()
-        title = (t.get("title") or "").strip() or "(untitled)"
+    def _clean_title(v: Any) -> str:
+        title = (str(v or "")).strip()
+        if not title:
+            return "(untitled)"
+        # keep it one-liner
+        title = title.replace("\r", " ").replace("\n", " ").strip()
+        return title
+
+    def _fmt_task_line(idx: int, t: Dict[str, Any]) -> str:
+        title = _clean_title(t.get("title"))
         due_d = _parse_due(t.get("due"))
         due_txt = f" (due {due_d.isoformat()})" if due_d else ""
-        return f"- {tid}: {title}{due_txt}"
+        return f"{idx}. {title}{due_txt}"
 
     def _section(title: str, items: List[Dict[str, Any]]) -> str:
         if not items:
             return f"{title}: 0"
+
         show = items[:limit_per_section]
         lines = [f"{title}: {len(items)}"]
-        lines.extend(_fmt_task_line(t) for t in show)
+
+        for i, t in enumerate(show, start=1):
+            lines.append(_fmt_task_line(i, t))
+
         if len(items) > len(show):
             lines.append(f"... (+{len(items) - len(show)} more)")
+
         return "\n".join(lines)
 
     header = f"Daily Brief ({today.isoformat()} SGT)"
@@ -187,13 +199,21 @@ def build_daily_brief_text(
             open_tasks = db.list_open_tasks(chat_id, limit=20)
         except Exception:
             open_tasks = []
+
         if not open_tasks:
             return header + "\n\nNo open tasks. Go touch grass 🌱"
 
         lines = [header, "", f"Open tasks: {len(open_tasks)}"]
-        lines.extend([f"- {t['id']}: {t['text']}" for t in open_tasks[:limit_per_section]])
+
+        show = open_tasks[:limit_per_section]
+        for i, t in enumerate(show, start=1):
+            txt = (t.get("text") or "").strip() or "(untitled)"
+            txt = txt.replace("\r", " ").replace("\n", " ").strip()
+            lines.append(f"{i}. {txt}")
+
         if len(open_tasks) > limit_per_section:
             lines.append(f"... (+{len(open_tasks) - limit_per_section} more)")
+
         lines.append("")
         lines.append("Tip: connect Notion to get Overdue/Due Today/Doing sections.")
         return "\n".join(lines).strip()
@@ -207,12 +227,19 @@ def build_daily_brief_text(
     lines = [header, "", f"Open tasks: {len(open_tasks)}"]
     tail = open_tasks[-20:]
     show = tail[:limit_per_section]
-    lines.extend([f"- {t.id}: {t.text}" for t in show])
+
+    for i, t in enumerate(show, start=1):
+        txt = (t.text or "").strip() or "(untitled)"
+        txt = txt.replace("\r", " ").replace("\n", " ").strip()
+        lines.append(f"{i}. {txt}")
+
     if len(tail) > limit_per_section:
         lines.append(f"... (+{len(tail) - limit_per_section} more)")
+
     lines.append("")
     lines.append("Tip: connect Notion to get Overdue/Due Today/Doing sections.")
     return "\n".join(lines).strip()
+
 
 
 def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]:
