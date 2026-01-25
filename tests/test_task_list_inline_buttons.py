@@ -3,7 +3,7 @@ import notion
 from ui import route_text
 
 
-def test_today_in_notion_mode_returns_done_and_open_buttons(monkeypatch):
+def test_today_in_notion_mode_returns_done_and_edit_buttons(monkeypatch):
     monkeypatch.setenv("NOTION_TOKEN", "t")
     monkeypatch.setenv("NOTION_NOTES_DB_ID", "notes_db")
     monkeypatch.setenv("NOTION_TASKS_DB_ID", "tasks_db")
@@ -40,22 +40,19 @@ def test_today_in_notion_mode_returns_done_and_open_buttons(monkeypatch):
 
     rm = actions[0].get("reply_markup")
     assert rm and "inline_keyboard" in rm
-    assert len(rm["inline_keyboard"]) == 2
 
+    # New UX: only 1 row, 2 buttons
+    assert len(rm["inline_keyboard"]) == 1
     row0 = rm["inline_keyboard"][0]
-    assert row0[0]["text"] == "✅ 1 Done"
-    assert row0[0]["callback_data"] == "done|task_id=page_1"
-    assert row0[1]["text"] == "Open 1"
-    assert row0[1]["url"] == core.notion.page_url("page_1")
-
-    row1 = rm["inline_keyboard"][1]
-    assert row1[0]["text"] == "✅ 2 Done"
-    assert row1[0]["callback_data"] == "done|task_id=page_2"
-    assert row1[1]["text"] == "Open 2"
-    assert row1[1]["url"] == core.notion.page_url("page_2")
+    assert len(row0) == 2
+    assert row0[0]["text"] == "Done"
+    assert row0[0]["callback_data"] == "pick_done"
+    assert row0[1]["text"] == "Edit"
+    assert row0[1]["callback_data"] == "pick_edit"
 
 
-def test_inbox_in_notion_mode_returns_done_and_open_buttons(monkeypatch):
+
+def test_inbox_in_notion_mode_returns_done_and_edit_buttons(monkeypatch):
     monkeypatch.setenv("NOTION_TOKEN", "t")
     monkeypatch.setenv("NOTION_NOTES_DB_ID", "notes_db")
     monkeypatch.setenv("NOTION_TASKS_DB_ID", "tasks_db")
@@ -89,10 +86,12 @@ def test_inbox_in_notion_mode_returns_done_and_open_buttons(monkeypatch):
 
     rm = actions[0].get("reply_markup")
     assert rm and "inline_keyboard" in rm
-    assert len(rm["inline_keyboard"]) == 1
 
+    # New UX: only 1 row, 2 buttons
+    assert len(rm["inline_keyboard"]) == 1
     row0 = rm["inline_keyboard"][0]
-    assert row0[0]["text"] == "✅ 1 Done"
-    assert row0[0]["callback_data"] == "done|task_id=page_A"
-    assert row0[1]["text"] == "Open 1"
-    assert row0[1]["url"] == core.notion.page_url("page_A")
+    assert len(row0) == 2
+    assert row0[0]["text"] == "Done"
+    assert row0[0]["callback_data"] == "pick_done"
+    assert row0[1]["text"] == "Edit"
+    assert row0[1]["callback_data"] == "pick_edit"

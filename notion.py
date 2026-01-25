@@ -651,6 +651,54 @@ def mark_task_done(page_id: str) -> bool:
     raise RuntimeError("Notion API error marking done; all fallbacks failed: " + " | ".join(last_errors))
 
 
+def update_task_title(page_id: str, new_title: str) -> bool:
+    """
+    Update a task page Title in Notion.
+    Returns True on success, raises RuntimeError on failure.
+    """
+    import os
+    import requests
+
+    raw_token = os.getenv("NOTION_TOKEN") or ""
+    token = raw_token.strip().replace("\r", "").replace("\n", "")
+    if not token:
+        raise RuntimeError("NOTION_TOKEN is not set")
+
+    notion_version = (os.getenv("NOTION_VERSION") or "2022-06-28").strip() or "2022-06-28"
+
+    page_id = (page_id or "").strip()
+    if not page_id:
+        raise ValueError("page_id is required")
+
+    new_title = (new_title or "").strip()
+    if not new_title:
+        raise ValueError("new_title must be non-empty")
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Notion-Version": notion_version,
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "properties": {
+            "Title": {"title": [{"type": "text", "text": {"content": new_title}}]}
+        }
+    }
+
+    r = requests.request(
+        "PATCH",
+        f"https://api.notion.com/v1/pages/{page_id}",
+        headers=headers,
+        json=payload,
+        timeout=30,
+    )
+
+    if r.status_code in (200, 201):
+        return True
+
+    snippet = (getattr(r, "text", "") or "")[:500]
+    raise RuntimeError(f"Notion API error {r.status_code} updating task title: {snippet}")
 
 
 def list_inbox_tasks(tasks_db_id: str, *, limit: int = 20) -> list[dict]:

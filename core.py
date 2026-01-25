@@ -47,6 +47,8 @@ class AppState:
     # key: (chat_id, message_id) -> rendered list payload for later edit
     render_cache: Dict[Tuple[int, int], Dict[str, Any]] = field(default_factory=dict)
 
+    # chat_id -> pending interaction state for multi-step UX (Done/Edit via item number)
+    pending: Dict[int, Dict[str, Any]] = field(default_factory=dict)
 
 
 def _now_iso() -> str:
@@ -246,19 +248,18 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
     """
     Core app handler.
 
-    PRD v1.5 persistence:
-    - Notion is source of truth for Notes/Tasks when configured.
-    - Postgres is used for settings/labels/message_map/jobs/embeddings (NOT raw note/task bodies).
-    - If Notion is not configured, fall back to existing DB/in-memory behavior.
-
-    Supported:
+    Supports:
     - /note <text>
     - /todo <text>
     - /today
+    - /inbox
     - /done <task_id>
     - /search <query>
-    - plain text -> note
-    - callback actions -> mapped into the above commands (WIP)
+    - /settings
+    - /help
+    - callback actions for task list UX:
+        - pick_done (asks for item number, then marks done)
+        - pick_edit (asks for item number, then asks for new text, then updates title)
     """
     et = event.get("type")
     chat_id = event.get("chat_id")
@@ -290,6 +291,8 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
         elif action == "done":
             task_id = (params.get("task_id") or params.get("id") or "").strip()
             route = {"kind": "command", "command": "done", "task_id": task_id}
+        elif action in {"pick_done", "pick_edit"}:
+            route = {"kind": "pick_action", "action": action}
         else:
             return reply(f"Unknown action: {action}")
 
@@ -327,39 +330,226 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
             return first
         return first[: max_len - 3] + "..."
 
-    def _short_label(s: str, max_len: int = 24) -> str:
-        s = (s or "").strip().replace("\n", " ")
-        if not s:
-            return "Untitled"
-        if len(s) <= max_len:
-            return s
-        return s[: max_len - 3] + "..."
-
     def _open_in_notion_markup(page_id: str) -> Dict[str, Any]:
         url = notion.page_url(page_id)
         return {"inline_keyboard": [[{"text": "Open in Notion", "url": url}]]}
 
+    def _two_button_task_list_markup() -> Dict[str, Any]:
+        # Only 2 buttons as requested
+        return {
+            "inline_keyboard": [
+                [
+                    {"text": "Done", "callback_data": "pick_done"},
+                    {"text": "Edit", "callback_data": "pick_edit"},
+                ]
+            ]
+        }
+
     def _save_message_map(kind: str, notion_page_id: str) -> None:
         """
         Best-effort traceability: Telegram message -> Notion page.
-        Runs only when DB enabled and message_id exists.
+
+        Supports multiple historical db.save_message_map signatures.
+        Primary expected signature (per current unit tests):
+        save_message_map(message_id, kind, notion_page_id, chat_id, user_id=None)
         """
         try:
             mid = event.get("message_id")
             uid = event.get("user_id")
+
             if (not db_enabled) or mid is None:
                 return
 
             db.init_db()
-            db.save_message_map(
-                message_id=int(mid),
-                kind=str(kind),
-                notion_page_id=str(notion_page_id),
-                chat_id=int(chat_id),
-                user_id=int(uid) if uid is not None else None,
-            )
+
+            # 1) Current tests expect: (message_id, kind, notion_page_id, chat_id, user_id=None)
+            try:
+                db.save_message_map(int(mid), str(kind), str(notion_page_id), int(chat_id), uid)
+                return
+            except TypeError:
+                pass
+
+            # 2) Variant without user_id
+            try:
+                db.save_message_map(int(mid), str(kind), str(notion_page_id), int(chat_id))
+                return
+            except TypeError:
+                pass
+
+            # 3) Keyword-args variants (different parameter names)
+            try:
+                db.save_message_map(
+                    message_id=int(mid),
+                    kind=str(kind),
+                    notion_page_id=str(notion_page_id),
+                    chat_id=int(chat_id),
+                    user_id=uid,
+                )
+                return
+            except TypeError:
+                pass
+
+            # 4) Older minimal variants
+            try:
+                db.save_message_map(int(chat_id), int(mid), str(notion_page_id))
+                return
+            except TypeError:
+                pass
+
         except Exception:
             return
+
+
+    # --- NEW: Multi-step UX handling for Done/Edit via item number ---
+    if et == "message":
+        pending = state.pending.get(chat_id)
+
+        # If user sends a command while pending, treat it as a reset (avoid accidental note capture).
+        if pending and isinstance(text, str) and text.strip().startswith("/"):
+            state.pending.pop(chat_id, None)
+            # continue into normal routing
+
+        # Only intercept plain text (non-command) when pending exists
+        if pending and route.get("kind") == "text":
+            mode = (pending.get("mode") or "").strip()
+            source_mid = pending.get("source_message_id")
+            raw = (text or "").strip()
+
+            def _get_cached_tasks() -> List[Dict[str, Any]] | None:
+                try:
+                    smid = int(source_mid)
+                except Exception:
+                    return None
+                cache = state.render_cache.get((chat_id, smid))
+                if not cache or not isinstance(cache, dict):
+                    return None
+                tasks = cache.get("tasks") or []
+                if not isinstance(tasks, list):
+                    return None
+                return tasks
+
+            if mode in {"done_pick", "edit_pick"}:
+                if not raw.isdigit():
+                    return reply("Reply with the item number (e.g. 2).")
+
+                idx = int(raw)
+                tasks = _get_cached_tasks()
+                if not tasks:
+                    state.pending.pop(chat_id, None)
+                    return reply("Task list expired. Run /today or /inbox again.")
+
+                if idx < 1 or idx > len(tasks):
+                    return reply(f"Invalid number. Choose 1 to {len(tasks)}.")
+
+                task = tasks[idx - 1]
+                task_id = str(task.get("id") or "").strip()
+                if not task_id:
+                    state.pending.pop(chat_id, None)
+                    return reply("That item is missing an id. Run /today again.")
+
+                if mode == "done_pick":
+                    # perform done
+                    if notion_enabled:
+                        ok = notion.mark_task_done(task_id)
+                        if not ok:
+                            state.pending.pop(chat_id, None)
+                            return reply("Could not mark done (Notion). Try /today again.")
+                    elif db_enabled:
+                        db.init_db()
+                        ok = db.mark_task_done(chat_id, task_id)
+                        if not ok:
+                            state.pending.pop(chat_id, None)
+                            return reply("Could not mark done. Try /today again.")
+                    else:
+                        for t in state.tasks[chat_id]:
+                            if t.id == task_id:
+                                t.done = True
+                                break
+
+                    state.pending.pop(chat_id, None)
+
+                    # edit the original list message to remove item + re-render list
+                    try:
+                        smid = int(source_mid)
+                    except Exception:
+                        return reply("Done. (Could not update the list message.)")
+
+                    return [{
+                        "type": "edit",
+                        "chat_id": chat_id,
+                        "message_id": smid,
+                        "remove_task_id": task_id,
+                    }]
+
+                # edit_pick -> ask for new text next
+                state.pending[chat_id] = {
+                    "mode": "edit_new_text",
+                    "source_message_id": int(source_mid) if isinstance(source_mid, int) or str(source_mid).isdigit() else source_mid,
+                    "task_id": task_id,
+                    "item_number": idx,
+                }
+                return reply(f"Send the new text for item {idx}.")
+
+            if mode == "edit_new_text":
+                task_id = str(pending.get("task_id") or "").strip()
+                item_no = pending.get("item_number")
+                new_title = raw
+
+                if not new_title:
+                    return reply("New text cannot be empty. Send the updated task text.")
+
+                # update title
+                if notion_enabled:
+                    notion.update_task_title(task_id, new_title)
+                elif db_enabled:
+                    # optional: implement later if you still use DB task lists
+                    try:
+                        db.init_db()
+                        if hasattr(db, "update_task_text"):
+                            db.update_task_text(chat_id, task_id, new_title)
+                    except Exception:
+                        pass
+                else:
+                    for t in state.tasks[chat_id]:
+                        if t.id == task_id:
+                            t.text = new_title
+                            break
+
+                state.pending.pop(chat_id, None)
+
+                try:
+                    smid = int(source_mid)
+                except Exception:
+                    return reply(f"Updated item {item_no}. (Could not update the list message.)")
+
+                return [{
+                    "type": "edit",
+                    "chat_id": chat_id,
+                    "message_id": smid,
+                    "update_task": {"id": task_id, "title": new_title},
+                }]
+
+    # --- routing commands ---
+    if route.get("kind") == "pick_action":
+        action = route.get("action")
+        mid = event.get("message_id")
+
+        if not isinstance(mid, int):
+            return reply("I can’t find the task list message. Run /today again.")
+
+        if action == "pick_done":
+            state.pending[chat_id] = {"mode": "done_pick", "source_message_id": mid}
+            tasks = (state.render_cache.get((chat_id, mid)) or {}).get("tasks") or []
+            n = len(tasks) if isinstance(tasks, list) else 0
+            return reply(f"Which item number to mark Done? (1 to {n})")
+
+        if action == "pick_edit":
+            state.pending[chat_id] = {"mode": "edit_pick", "source_message_id": mid}
+            tasks = (state.render_cache.get((chat_id, mid)) or {}).get("tasks") or []
+            n = len(tasks) if isinstance(tasks, list) else 0
+            return reply(f"Which item number to Edit? (1 to {n})")
+
+        return reply("Unknown action.")
 
     if route.get("kind") == "command":
         cmd = route.get("command")
@@ -435,8 +625,7 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
                     return reply("No open tasks. Go touch grass 🌱")
 
                 lines = []
-                keyboard_rows = []
-                rendered_tasks = []  # for cache
+                rendered_tasks = []
 
                 for i, t in enumerate(tasks, start=1):
                     tid = t["id"]
@@ -447,13 +636,6 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
                     due_txt = f" (due {due})" if due else ""
                     lines.append(f"{i}. {title}{due_txt}")
 
-                    keyboard_rows.append(
-                        [
-                            {"text": f"✅ {i} Done", "callback_data": f"done|task_id={tid}"},
-                            {"text": f"Open {i}", "url": notion.page_url(tid)},
-                        ]
-                    )
-
                     rendered_tasks.append({"id": tid, "title": title, "due": due, "status": status})
 
                 text_out = f"Open tasks: {len(tasks)}\n" + "\n".join(lines)
@@ -463,7 +645,7 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
                         "type": "reply",
                         "chat_id": chat_id,
                         "text": text_out,
-                        "reply_markup": {"inline_keyboard": keyboard_rows},
+                        "reply_markup": _two_button_task_list_markup(),
                         "disable_web_page_preview": True,
                     },
                     {
@@ -496,7 +678,6 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
                     return reply("Inbox is empty. Suspiciously productive. 😎")
 
                 lines = []
-                keyboard_rows = []
                 rendered_tasks = []
 
                 for i, t in enumerate(tasks, start=1):
@@ -504,16 +685,8 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
                     title = (t.get("title") or "").strip()
                     due = t.get("due")
                     status = t.get("status") or "todo"
-
                     due_txt = f" (due {due})" if due else ""
                     lines.append(f"{i}. [{status}] {title}{due_txt}")
-
-                    keyboard_rows.append(
-                        [
-                            {"text": f"✅ {i} Done", "callback_data": f"done|task_id={tid}"},
-                            {"text": f"Open {i}", "url": notion.page_url(tid)},
-                        ]
-                    )
 
                     rendered_tasks.append({"id": tid, "title": title, "due": due, "status": status})
 
@@ -524,7 +697,7 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
                         "type": "reply",
                         "chat_id": chat_id,
                         "text": text_out,
-                        "reply_markup": {"inline_keyboard": keyboard_rows},
+                        "reply_markup": _two_button_task_list_markup(),
                         "disable_web_page_preview": True,
                     },
                     {
@@ -555,13 +728,11 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
             if not task_id:
                 return reply("Missing task id. Usage: /done <task_id>")
 
-            # ---- perform the "done" operation ----
             if notion_enabled:
                 ok = notion.mark_task_done(task_id)
                 if not ok:
                     return reply(f"Task not found (Notion): {task_id}")
 
-                # If callback, ask main.py to edit the original message (better UX)
                 if et == "callback" and isinstance(event.get("message_id"), int):
                     return [{
                         "type": "edit",
@@ -570,7 +741,6 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
                         "remove_task_id": task_id,
                     }]
 
-                # Keep existing behavior for text command
                 return reply(f"Marked done (Notion): {task_id}")
 
             if db_enabled:
@@ -589,7 +759,6 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
 
                 return reply(f"Marked done: {task_id}")
 
-            # in-memory fallback
             found = False
             for t in state.tasks[chat_id]:
                 if t.id == task_id:
@@ -773,5 +942,6 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
         return reply(route.get("message", "Error"))
 
     return []
+
 
 

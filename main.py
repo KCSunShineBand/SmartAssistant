@@ -258,29 +258,11 @@ async def telegram_webhook(request: Request):
     Compatibility:
     - Returns response fields used by existing unit tests:
         { ok, type, sent, errors, actions }
-
-    Webhook origin hardening (recommended):
-    - If TELEGRAM_WEBHOOK_SECRET is set, require header:
-        X-Telegram-Bot-Api-Secret-Token == TELEGRAM_WEBHOOK_SECRET
-      (This header is sent by Telegram when you setWebhook with secret_token.)
-
-    Owner-only gate:
-    - If TELEGRAM_ALLOWED_USER_ID is set -> only that user_id is processed.
-    - If TELEGRAM_ALLOWED_USER_ID is missing/invalid:
-        - default: allow all (dev friendly)
-        - strict mode: ignore all (fail closed)
-
-    Strict mode triggers if:
-      - APP_ENV in {"prod","production"}
-      - or TELEGRAM_STRICT_OWNER_ONLY in {"1","true","yes"}
     """
-
-    # --- optional Telegram webhook secret header check (cheap, before reading body) ---
     expected_hook_secret = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
     if expected_hook_secret:
         got = (request.headers.get("X-Telegram-Bot-Api-Secret-Token") or "").strip()
         if got != expected_hook_secret:
-            # Return 200 so Telegram/clients don't aggressively retry; we just do nothing.
             return {
                 "ok": True,
                 "type": "unauthorized",
@@ -298,17 +280,13 @@ async def telegram_webhook(request: Request):
     event = normalize_update(update)
     event_type = event.get("type", "unsupported")
 
-    # --- ACK callback early to stop Telegram spinner (best-effort) ---
+    # ACK callback early (best-effort)
     if event_type == "callback":
         cbid = event.get("callback_id")
         if isinstance(cbid, str) and cbid.strip():
             try:
                 answer_callback_query(cbid)
-            except RuntimeError:
-                # Missing token in dev/test -> ignore
-                pass
             except Exception:
-                # Don't fail webhook for callback ack issues
                 pass
 
     strict = os.getenv("APP_ENV", "").lower() in {"prod", "production"} or os.getenv(
@@ -316,7 +294,6 @@ async def telegram_webhook(request: Request):
     ).strip().lower() in {"1", "true", "yes"}
 
     allowed_raw = os.getenv("TELEGRAM_ALLOWED_USER_ID", "").strip()
-
     allowed_user_id = None
     if allowed_raw:
         try:
@@ -324,39 +301,16 @@ async def telegram_webhook(request: Request):
         except Exception:
             allowed_user_id = None
 
-    # If strict mode and allowlist missing/invalid -> deny all (fail closed)
     if strict and allowed_user_id is None:
-        return {
-            "ok": True,
-            "type": event_type,
-            "unauthorized": True,
-            "sent": 0,
-            "errors": 0,
-            "actions": [],
-        }
+        return {"ok": True, "type": event_type, "unauthorized": True, "sent": 0, "errors": 0, "actions": []}
 
-    # If allowlist is configured -> enforce it
     if allowed_user_id is not None:
         sender_user_id = event.get("user_id")
         try:
             if int(sender_user_id) != allowed_user_id:
-                return {
-                    "ok": True,
-                    "type": event_type,
-                    "unauthorized": True,
-                    "sent": 0,
-                    "errors": 0,
-                    "actions": [],
-                }
+                return {"ok": True, "type": event_type, "unauthorized": True, "sent": 0, "errors": 0, "actions": []}
         except Exception:
-            return {
-                "ok": True,
-                "type": event_type,
-                "unauthorized": True,
-                "sent": 0,
-                "errors": 0,
-                "actions": [],
-            }
+            return {"ok": True, "type": event_type, "unauthorized": True, "sent": 0, "errors": 0, "actions": []}
 
     # persist chat_id best-effort
     if os.getenv("DATABASE_URL", "").strip():
@@ -371,128 +325,120 @@ async def telegram_webhook(request: Request):
             pass
 
     actions = handle_event(event, STATE)
-
     sent = 0
     errors = 0
 
+    def _two_button_markup():
+        return {
+            "inline_keyboard": [
+                [
+                    {"text": "Done", "callback_data": "pick_done"},
+                    {"text": "Edit", "callback_data": "pick_edit"},
+                ]
+            ]
+        }
+
+    def _render_list(list_kind: str, tasks: list[dict]) -> tuple[str, dict | None]:
+        if not tasks:
+            return ("All done 🎉", None)
+
+        if list_kind == "today":
+            header = f"Open tasks: {len(tasks)}"
+            lines = []
+            for i, t in enumerate(tasks, start=1):
+                title = (t.get("title") or "").strip()
+                due = t.get("due")
+                due_txt = f" (due {due})" if due else ""
+                lines.append(f"{i}. {title}{due_txt}")
+            return (header + "\n" + "\n".join(lines), _two_button_markup())
+
+        if list_kind == "inbox":
+            header = "Inbox (open tasks):"
+            lines = []
+            for i, t in enumerate(tasks, start=1):
+                title = (t.get("title") or "").strip()
+                due = t.get("due")
+                status = t.get("status") or "todo"
+                due_txt = f" (due {due})" if due else ""
+                lines.append(f"{i}. [{status}] {title}{due_txt}")
+            return (header + "\n" + "\n".join(lines), _two_button_markup())
+
+        return (f"Tasks: {len(tasks)}", _two_button_markup())
+
     for a in actions:
-            # --- NEW: execute edit actions (e.g., after callback "done") ---
+        # execute edit actions (update cached list + edit the original message)
         if a.get("type") == "edit":
             try:
                 chat_id = int(a["chat_id"])
                 message_id = int(a["message_id"])
                 remove_task_id = str(a.get("remove_task_id") or "").strip()
+                update_task = a.get("update_task") or {}
 
-                # Try to re-render the original task list message from cache
                 cache = getattr(STATE, "render_cache", {}).get((chat_id, message_id))
-                if cache and isinstance(cache, dict):
-                    tasks = list(cache.get("tasks") or [])
-                    list_kind = cache.get("list_kind") or "tasks"
-
-                    # Remove the completed task
-                    tasks = [t for t in tasks if str(t.get("id")) != remove_task_id]
-
-                    if not tasks:
-                        # All done — replace message and remove keyboard
-                        new_text = "All done 🎉"
-                        new_markup = None
-                    else:
-                        # Rebuild text + keyboard
-                        if list_kind == "today":
-                            header = f"Open tasks: {len(tasks)}"
-                            lines = []
-                            keyboard_rows = []
-
-                            for i, t in enumerate(tasks, start=1):
-                                tid = str(t.get("id") or "")
-                                title = (t.get("title") or "").strip()
-                                due = t.get("due")
-                                due_txt = f" (due {due})" if due else ""
-
-                                lines.append(f"{i}. {title}{due_txt}")
-                                keyboard_rows.append(
-                                    [
-                                        {"text": f"✅ {i} Done", "callback_data": f"done|task_id={tid}"},
-                                        {"text": f"Open {i}", "url": notion.page_url(tid)},
-                                    ]
-                                )
-
-                            new_text = header + "\n" + "\n".join(lines)
-                            new_markup = {"inline_keyboard": keyboard_rows}
-
-                        elif list_kind == "inbox":
-                            header = "Inbox (open tasks):"
-                            lines = []
-                            keyboard_rows = []
-
-                            for i, t in enumerate(tasks, start=1):
-                                tid = str(t.get("id") or "")
-                                title = (t.get("title") or "").strip()
-                                due = t.get("due")
-                                status = t.get("status") or "todo"
-                                due_txt = f" (due {due})" if due else ""
-
-                                lines.append(f"{i}. [{status}] {title}{due_txt}")
-                                keyboard_rows.append(
-                                    [
-                                        {"text": f"✅ {i} Done", "callback_data": f"done|task_id={tid}"},
-                                        {"text": f"Open {i}", "url": notion.page_url(tid)},
-                                    ]
-                                )
-
-                            new_text = header + "\n" + "\n".join(lines)
-                            new_markup = {"inline_keyboard": keyboard_rows}
-                        else:
-                            # Unknown kind — fallback to simple confirmation
-                            new_text = f"✅ Done: {remove_task_id}"
-                            new_markup = None
-
-                    # Persist updated cache (or clear if empty)
-                    try:
-                        if hasattr(STATE, "render_cache"):
-                            if tasks:
-                                STATE.render_cache[(chat_id, message_id)] = {
-                                    "list_kind": list_kind,
-                                    "tasks": tasks,
-                                    "text": new_text,
-                                }
-                            else:
-                                STATE.render_cache.pop((chat_id, message_id), None)
-                    except Exception:
-                        pass
-
+                if not cache or not isinstance(cache, dict):
+                    # no cache -> fallback edit
                     edit_telegram_message(
                         chat_id=chat_id,
                         message_id=message_id,
-                        text=new_text,
-                        reply_markup=new_markup,
-                        disable_web_page_preview=True,
-                    )
-                else:
-                    # No cache — fallback to simple confirmation
-                    edit_telegram_message(
-                        chat_id=chat_id,
-                        message_id=message_id,
-                        text=f"✅ Done: {remove_task_id}",
+                        text="Updated.",
                         reply_markup=None,
                         disable_web_page_preview=True,
                     )
+                    continue
 
+                tasks = list(cache.get("tasks") or [])
+                list_kind = cache.get("list_kind") or "today"
+
+                # apply title update
+                if isinstance(update_task, dict) and update_task.get("id"):
+                    uid = str(update_task.get("id"))
+                    new_title = str(update_task.get("title") or "").strip()
+                    if new_title:
+                        for t in tasks:
+                            if str(t.get("id")) == uid:
+                                t["title"] = new_title
+                                break
+
+                # apply removal
+                if remove_task_id:
+                    tasks = [t for t in tasks if str(t.get("id")) != remove_task_id]
+
+                new_text, new_markup = _render_list(list_kind, tasks)
+
+                # persist updated cache (or clear if empty)
+                try:
+                    if hasattr(STATE, "render_cache"):
+                        if tasks:
+                            STATE.render_cache[(chat_id, message_id)] = {
+                                "list_kind": list_kind,
+                                "tasks": tasks,
+                                "text": new_text,
+                            }
+                        else:
+                            STATE.render_cache.pop((chat_id, message_id), None)
+                except Exception:
+                    pass
+
+                edit_telegram_message(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=new_text,
+                    reply_markup=new_markup,
+                    disable_web_page_preview=True,
+                )
             except RuntimeError:
-                # Missing token in dev/test should not be treated as an error
                 pass
             except Exception:
                 errors += 1
             continue
 
-        # existing reply path
+        # reply actions
         if a.get("type") != "reply":
             continue
 
         chat_id = int(a["chat_id"])
         text = str(a["text"])
 
-        # Only pass optional kwargs when they exist (avoid breaking old fakes/tests)
         kwargs = {}
         if a.get("reply_markup") is not None:
             kwargs["reply_markup"] = a.get("reply_markup")
@@ -503,16 +449,13 @@ async def telegram_webhook(request: Request):
 
         try:
             try:
-                # Newer sender supports kwargs
                 resp = send_telegram_message(chat_id, text, **kwargs)
             except TypeError:
-                # Backwards-compatible: monkeypatched send_telegram_message(chat_id, text) in tests
                 resp = send_telegram_message(chat_id, text)
 
             sent += 1
 
-            # --- NEW: store task-list render cache if core emitted it ---
-            # Look for a cache_task_list action for this chat_id in this same webhook run.
+            # store render cache if core emitted it
             try:
                 result = (resp or {}).get("result") or {}
                 mid = result.get("message_id")
@@ -526,18 +469,14 @@ async def telegram_webhook(request: Request):
                             }
                             break
             except Exception:
-                # Never break webhook on cache issues
                 pass
 
         except RuntimeError:
-            # Missing token in dev/test should not be treated as an error
             pass
         except Exception:
             errors += 1
 
-
     return {"ok": True, "type": event_type, "sent": sent, "errors": errors, "actions": actions}
-
 
 
 @app.post("/admin/notion/setup")

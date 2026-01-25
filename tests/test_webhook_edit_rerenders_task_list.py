@@ -58,8 +58,13 @@ def test_edit_action_rerenders_from_cache(monkeypatch):
     assert "1. Write report" in called["text"]
 
     # Should still have buttons (1 row left)
+    # New UX: should still have 2 buttons (Done/Edit)
     rm = called.get("reply_markup") or {}
     assert "inline_keyboard" in rm
     assert len(rm["inline_keyboard"]) == 1
     row0 = rm["inline_keyboard"][0]
-    assert row0[0]["callback_data"] == "done|task_id=page_2"
+    assert row0[0]["callback_data"] == "pick_done"
+    assert row0[0]["text"] == "Done"
+    assert row0[1]["callback_data"] == "pick_edit"
+    assert row0[1]["text"] == "Edit"
+
