@@ -1,5 +1,5 @@
-import main
 from fastapi.testclient import TestClient
+import main
 
 
 def test_edit_action_rerenders_from_cache(monkeypatch):
@@ -13,9 +13,13 @@ def test_edit_action_rerenders_from_cache(monkeypatch):
         "text": "Open tasks: 2 ...",
     }
 
-    monkeypatch.setattr(main, "handle_event", lambda event, state: [
-        {"type": "edit", "chat_id": 555, "message_id": 777, "remove_task_id": "page_1"}
-    ])
+    monkeypatch.setattr(
+        main,
+        "handle_event",
+        lambda event, state: [
+            {"type": "edit", "chat_id": 555, "message_id": 777, "remove_task_id": "page_1"}
+        ],
+    )
 
     called = {}
 
@@ -44,14 +48,18 @@ def test_edit_action_rerenders_from_cache(monkeypatch):
 
     assert called["chat_id"] == 555
     assert called["message_id"] == 777
-    assert "page_1" not in called["text"]
-    assert "page_2" in called["text"]
-    rm = called["reply_markup"]
-    assert rm and "inline_keyboard" in rm
-    # should now be 1 row left
-    assert len(rm["inline_keyboard"]) == 1
 
-    # cache should now only contain page_2
-    cached = main.STATE.render_cache[(555, 777)]
-    assert len(cached["tasks"]) == 1
-    assert cached["tasks"][0]["id"] == "page_2"
+    # New UX: edited message should NOT leak Notion IDs
+    assert "page_1" not in called["text"]
+    assert "page_2" not in called["text"]
+
+    # Should show remaining task by title in numbered format
+    assert "Open tasks: 1" in called["text"]
+    assert "1. Write report" in called["text"]
+
+    # Should still have buttons (1 row left)
+    rm = called.get("reply_markup") or {}
+    assert "inline_keyboard" in rm
+    assert len(rm["inline_keyboard"]) == 1
+    row0 = rm["inline_keyboard"][0]
+    assert row0[0]["callback_data"] == "done|task_id=page_2"

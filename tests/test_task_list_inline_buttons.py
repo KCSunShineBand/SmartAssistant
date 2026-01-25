@@ -29,15 +29,30 @@ def test_today_in_notion_mode_returns_done_and_open_buttons(monkeypatch):
 
     actions = core.handle_event(ev, core.AppState())
     assert actions and actions[0]["type"] == "reply"
+
+    # Verify message text is numbered and hides IDs
+    txt = actions[0].get("text") or ""
+    assert "Open tasks: 2" in txt
+    assert "1. Pay rent" in txt
+    assert "2. Write report" in txt
+    assert "page_1" not in txt
+    assert "page_2" not in txt
+
     rm = actions[0].get("reply_markup")
     assert rm and "inline_keyboard" in rm
     assert len(rm["inline_keyboard"]) == 2
 
     row0 = rm["inline_keyboard"][0]
-    assert row0[0]["text"] == "✅ Done"
+    assert row0[0]["text"] == "✅ 1 Done"
     assert row0[0]["callback_data"] == "done|task_id=page_1"
-    assert row0[1]["text"] == "Open"
-    assert row0[1]["url"] == notion.page_url("page_1")
+    assert row0[1]["text"] == "Open 1"
+    assert row0[1]["url"] == core.notion.page_url("page_1")
+
+    row1 = rm["inline_keyboard"][1]
+    assert row1[0]["text"] == "✅ 2 Done"
+    assert row1[0]["callback_data"] == "done|task_id=page_2"
+    assert row1[1]["text"] == "Open 2"
+    assert row1[1]["url"] == core.notion.page_url("page_2")
 
 
 def test_inbox_in_notion_mode_returns_done_and_open_buttons(monkeypatch):
@@ -65,12 +80,19 @@ def test_inbox_in_notion_mode_returns_done_and_open_buttons(monkeypatch):
 
     actions = core.handle_event(ev, core.AppState())
     assert actions and actions[0]["type"] == "reply"
+
+    # Verify message text is numbered and hides IDs
+    txt = actions[0].get("text") or ""
+    assert "Inbox (open tasks):" in txt
+    assert "1. [todo] Buy milk" in txt
+    assert "page_A" not in txt
+
     rm = actions[0].get("reply_markup")
     assert rm and "inline_keyboard" in rm
     assert len(rm["inline_keyboard"]) == 1
 
     row0 = rm["inline_keyboard"][0]
-    assert row0[0]["text"] == "✅ Done"
+    assert row0[0]["text"] == "✅ 1 Done"
     assert row0[0]["callback_data"] == "done|task_id=page_A"
-    assert row0[1]["text"] == "Open"
-    assert row0[1]["url"] == notion.page_url("page_A")
+    assert row0[1]["text"] == "Open 1"
+    assert row0[1]["url"] == core.notion.page_url("page_A")

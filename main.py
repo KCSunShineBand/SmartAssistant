@@ -402,18 +402,21 @@ async def telegram_webhook(request: Request):
                             header = f"Open tasks: {len(tasks)}"
                             lines = []
                             keyboard_rows = []
-                            for t in tasks:
+
+                            for i, t in enumerate(tasks, start=1):
                                 tid = str(t.get("id") or "")
                                 title = (t.get("title") or "").strip()
                                 due = t.get("due")
                                 due_txt = f" (due {due})" if due else ""
-                                lines.append(f"- {tid}: {title}{due_txt}")
+
+                                lines.append(f"{i}. {title}{due_txt}")
                                 keyboard_rows.append(
                                     [
-                                        {"text": "✅ Done", "callback_data": f"done|task_id={tid}"},
-                                        {"text": "Open", "url": notion.page_url(tid)},
+                                        {"text": f"✅ {i} Done", "callback_data": f"done|task_id={tid}"},
+                                        {"text": f"Open {i}", "url": notion.page_url(tid)},
                                     ]
                                 )
+
                             new_text = header + "\n" + "\n".join(lines)
                             new_markup = {"inline_keyboard": keyboard_rows}
 
@@ -421,19 +424,22 @@ async def telegram_webhook(request: Request):
                             header = "Inbox (open tasks):"
                             lines = []
                             keyboard_rows = []
-                            for t in tasks:
+
+                            for i, t in enumerate(tasks, start=1):
                                 tid = str(t.get("id") or "")
                                 title = (t.get("title") or "").strip()
                                 due = t.get("due")
                                 status = t.get("status") or "todo"
                                 due_txt = f" (due {due})" if due else ""
-                                lines.append(f"- [{status}] {tid}: {title}{due_txt}")
+
+                                lines.append(f"{i}. [{status}] {title}{due_txt}")
                                 keyboard_rows.append(
                                     [
-                                        {"text": "✅ Done", "callback_data": f"done|task_id={tid}"},
-                                        {"text": "Open", "url": notion.page_url(tid)},
+                                        {"text": f"✅ {i} Done", "callback_data": f"done|task_id={tid}"},
+                                        {"text": f"Open {i}", "url": notion.page_url(tid)},
                                     ]
                                 )
+
                             new_text = header + "\n" + "\n".join(lines)
                             new_markup = {"inline_keyboard": keyboard_rows}
                         else:

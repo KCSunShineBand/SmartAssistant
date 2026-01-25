@@ -300,6 +300,14 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
             return first
         return first[: max_len - 3] + "..."
 
+    def _short_label(s: str, max_len: int = 24) -> str:
+        s = (s or "").strip().replace("\n", " ")
+        if not s:
+            return "Untitled"
+        if len(s) <= max_len:
+            return s
+        return s[: max_len - 3] + "..."
+
     def _open_in_notion_markup(page_id: str) -> Dict[str, Any]:
         url = notion.page_url(page_id)
         return {"inline_keyboard": [[{"text": "Open in Notion", "url": url}]]}
@@ -401,28 +409,25 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
 
                 lines = []
                 keyboard_rows = []
-
                 rendered_tasks = []  # for cache
 
-                for t in tasks:
+                for i, t in enumerate(tasks, start=1):
                     tid = t["id"]
                     title = (t.get("title") or "").strip()
                     due = t.get("due")
                     status = t.get("status") or "todo"
 
                     due_txt = f" (due {due})" if due else ""
-                    lines.append(f"- {tid}: {title}{due_txt}")
+                    lines.append(f"{i}. {title}{due_txt}")
 
                     keyboard_rows.append(
                         [
-                            {"text": "✅ Done", "callback_data": f"done|task_id={tid}"},
-                            {"text": "Open", "url": notion.page_url(tid)},
+                            {"text": f"✅ {i} Done", "callback_data": f"done|task_id={tid}"},
+                            {"text": f"Open {i}", "url": notion.page_url(tid)},
                         ]
                     )
 
-                    rendered_tasks.append(
-                        {"id": tid, "title": title, "due": due, "status": status}
-                    )
+                    rendered_tasks.append({"id": tid, "title": title, "due": due, "status": status})
 
                 text_out = f"Open tasks: {len(tasks)}\n" + "\n".join(lines)
 
@@ -442,7 +447,6 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
                         "text": text_out,
                     },
                 ]
-
 
             if db_enabled:
                 db.init_db()
@@ -468,25 +472,23 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
                 keyboard_rows = []
                 rendered_tasks = []
 
-                for t in tasks:
+                for i, t in enumerate(tasks, start=1):
                     tid = t["id"]
                     title = (t.get("title") or "").strip()
                     due = t.get("due")
                     status = t.get("status") or "todo"
 
                     due_txt = f" (due {due})" if due else ""
-                    lines.append(f"- [{status}] {tid}: {title}{due_txt}")
+                    lines.append(f"{i}. [{status}] {title}{due_txt}")
 
                     keyboard_rows.append(
                         [
-                            {"text": "✅ Done", "callback_data": f"done|task_id={tid}"},
-                            {"text": "Open", "url": notion.page_url(tid)},
+                            {"text": f"✅ {i} Done", "callback_data": f"done|task_id={tid}"},
+                            {"text": f"Open {i}", "url": notion.page_url(tid)},
                         ]
                     )
 
-                    rendered_tasks.append(
-                        {"id": tid, "title": title, "due": due, "status": status}
-                    )
+                    rendered_tasks.append({"id": tid, "title": title, "due": due, "status": status})
 
                 text_out = "Inbox (open tasks):\n" + "\n".join(lines)
 
@@ -506,7 +508,6 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
                         "text": text_out,
                     },
                 ]
-
 
             if db_enabled:
                 db.init_db()
@@ -583,7 +584,6 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
                 }]
 
             return reply(f"Marked done: {task_id}")
-
 
         if cmd == "search":
             q = (route.get("query") or "").strip()
@@ -746,4 +746,5 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
         return reply(route.get("message", "Error"))
 
     return []
+
 
