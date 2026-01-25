@@ -651,13 +651,23 @@ def mark_task_done(page_id: str) -> bool:
     raise RuntimeError("Notion API error marking done; all fallbacks failed: " + " | ".join(last_errors))
 
 
-def update_task_title(page_id: str, new_title: str) -> bool:
+def mark_task_done(page_id: str) -> bool:
     """
-    Update a task page Title in Notion.
-    Returns True on success, raises RuntimeError on failure.
+    Mark a task as done in Notion.
+
+    Key fix:
+    - Do NOT assume the done option is literally named "done".
+    - Many Notion DBs use "Done", "✅ Done", "Completed", etc.
+    - We fetch the Tasks DB schema (via NOTION_TASKS_DB_ID) to discover the actual Status options,
+      pick the best "done-like" option, and then PATCH the page using that name.
+
+    Compatibility:
+    - Supports both Notion "status" and "select" property types for Status.
+    - Tries setting "Completed At" too; retries without it if the DB doesn't have that property.
     """
     import os
     import requests
+    from datetime import datetime, timezone
 
     raw_token = os.getenv("NOTION_TOKEN") or ""
     token = raw_token.strip().replace("\r", "").replace("\n", "")
@@ -670,9 +680,7 @@ def update_task_title(page_id: str, new_title: str) -> bool:
     if not page_id:
         raise ValueError("page_id is required")
 
-    new_title = (new_title or "").strip()
-    if not new_title:
-        raise ValueError("new_title must be non-empty")
+    tasks_db_id = (os.getenv("NOTION_TASKS_DB_ID") or "").strip()
 
     headers = {
         "Authorization": f"Bearer {token}",
@@ -680,25 +688,112 @@ def update_task_title(page_id: str, new_title: str) -> bool:
         "Content-Type": "application/json",
     }
 
-    payload = {
-        "properties": {
-            "Title": {"title": [{"type": "text", "text": {"content": new_title}}]}
-        }
-    }
+    completed_at_iso = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
-    r = requests.request(
-        "PATCH",
-        f"https://api.notion.com/v1/pages/{page_id}",
-        headers=headers,
-        json=payload,
-        timeout=30,
-    )
+    # ---- Discover actual Status options from the Tasks DB (best effort) ----
+    status_prop_type = None  # "status" or "select"
+    option_names: list[str] = []
 
-    if r.status_code in (200, 201):
-        return True
+    if tasks_db_id:
+        try:
+            rdb = requests.request(
+                "GET",
+                f"https://api.notion.com/v1/databases/{tasks_db_id}",
+                headers=headers,
+                timeout=30,
+            )
+            if rdb.status_code < 400:
+                dbj = rdb.json() or {}
+                props = dbj.get("properties") or {}
+                status_obj = props.get("Status") or {}
+                status_prop_type = status_obj.get("type")
 
-    snippet = (getattr(r, "text", "") or "")[:500]
-    raise RuntimeError(f"Notion API error {r.status_code} updating task title: {snippet}")
+                if status_prop_type == "status":
+                    opts = ((status_obj.get("status") or {}).get("options")) or []
+                    option_names = [str(o.get("name") or "").strip() for o in opts if (o.get("name") or "").strip()]
+                elif status_prop_type == "select":
+                    opts = ((status_obj.get("select") or {}).get("options")) or []
+                    option_names = [str(o.get("name") or "").strip() for o in opts if (o.get("name") or "").strip()]
+        except Exception:
+            # If schema lookup fails, we still proceed with fallbacks.
+            pass
+
+    def _pick_done_name(names: list[str]) -> str:
+        # Prefer exact matches first, then "contains" matches.
+        if not names:
+            return "Done"
+
+        # Exact preferences
+        for target in ["Done", "done", "✅ Done", "Completed", "Complete"]:
+            for n in names:
+                if n == target:
+                    return n
+
+        # Contains preferences
+        lowered = [(n, n.lower()) for n in names]
+        for n, lo in lowered:
+            if "done" in lo:
+                return n
+        for n, lo in lowered:
+            if "complete" in lo:
+                return n
+
+        # Fallback to the first option if nothing matches
+        return names[0]
+
+    done_name = _pick_done_name(option_names)
+
+    # Build a compact set of candidate done names (schema-derived + common fallbacks)
+    candidates: list[str] = []
+    for n in [done_name, "Done", "done", "✅ Done", "Completed", "Complete"]:
+        n2 = (n or "").strip()
+        if n2 and n2 not in candidates:
+            candidates.append(n2)
+
+    # Prefer the actual Status property type if we discovered it; otherwise try both.
+    kinds = []
+    if status_prop_type in ("status", "select"):
+        kinds.append(status_prop_type)
+    for k in ("status", "select"):
+        if k not in kinds:
+            kinds.append(k)
+
+    def _payload(kind: str, name: str, include_completed_at: bool) -> dict:
+        props: dict = {}
+        if kind == "status":
+            props["Status"] = {"status": {"name": name}}
+        else:
+            props["Status"] = {"select": {"name": name}}
+
+        if include_completed_at:
+            props["Completed At"] = {"date": {"start": completed_at_iso}}
+
+        return {"properties": props}
+
+    last_errors: list[str] = []
+
+    # Try:
+    # - preferred kind first (status/select)
+    # - preferred done name first
+    # - include Completed At first
+    for kind in kinds:
+        for name in candidates:
+            for include_completed_at in (True, False):
+                payload = _payload(kind, name, include_completed_at)
+                r = requests.request(
+                    "PATCH",
+                    f"https://api.notion.com/v1/pages/{page_id}",
+                    headers=headers,
+                    json=payload,
+                    timeout=30,
+                )
+                if r.status_code in (200, 201):
+                    return True
+
+                snippet = (getattr(r, "text", "") or "")[:300]
+                last_errors.append(f"{kind}:{name}:completed={include_completed_at} -> {r.status_code} {snippet}")
+
+    raise RuntimeError("Notion API error marking done; all fallbacks failed: " + " | ".join(last_errors))
 
 
 def list_inbox_tasks(tasks_db_id: str, *, limit: int = 20) -> list[dict]:
