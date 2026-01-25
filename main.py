@@ -617,86 +617,83 @@ async def cron_daily_brief(
     """
     Trigger Daily Brief send (intended for Cloud Scheduler).
 
-    Cloud Scheduler often sends Content-Type: application/octet-stream even if you
-    try to set application/json. So we parse the raw body ourselves and treat it
-    as JSON when possible.
-
-    Security:
-      - If CRON_DAILY_BRIEF_KEY env var is set, require header X-Cron-Key to match.
-
-    Target chat:
-      - payload.chat_id (preferred override)
-      - else TELEGRAM_CHAT_ID env var
-      - else (if DATABASE_URL set) settings.telegram_chat_id from Postgres
+    - Accepts JSON or application/octet-stream body.
+    - Security: if CRON_DAILY_BRIEF_KEY is set, require X-Cron-Key to match.
+    - Target chat:
+        payload.chat_id (preferred)
+        else TELEGRAM_CHAT_ID env var
+        else (if DATABASE_URL set) settings.telegram_chat_id from Postgres
     """
     import json as _json
+    import core as core_mod  # <-- FIX: ensure core is in scope
 
+    # --- enforce cron key if configured ---
     required_key = os.getenv("CRON_DAILY_BRIEF_KEY", "").strip()
-    if required_key and x_cron_key != required_key:
+    if required_key and (x_cron_key or "") != required_key:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    # Parse payload from raw request body (works regardless of Content-Type)
-    payload: dict = {}
+    # --- parse body robustly (Cloud Scheduler may send octet-stream) ---
+    payload: Dict[str, Any] = {}
     try:
-        raw = await request.body()
-        if raw:
-            try:
-                payload_obj = _json.loads(raw.decode("utf-8"))
-                if isinstance(payload_obj, dict):
-                    payload = payload_obj
-            except Exception:
-                payload = {}
+        data = await request.json()
+        if isinstance(data, dict):
+            payload = data
     except Exception:
-        payload = {}
-
-    chat_id = None
-
-    # payload override
-    if payload.get("chat_id") is not None:
         try:
-            chat_id = int(payload.get("chat_id"))
+            raw = await request.body()
+            if raw:
+                data = _json.loads(raw.decode("utf-8"))
+                if isinstance(data, dict):
+                    payload = data
         except Exception:
-            raise HTTPException(status_code=400, detail="chat_id must be int")
+            payload = {}
 
-    # env fallback
-    if chat_id is None:
+    # --- resolve chat_id ---
+    chat_id_val: Any = payload.get("chat_id")
+
+    if not chat_id_val:
         env_chat = os.getenv("TELEGRAM_CHAT_ID", "").strip()
         if env_chat:
+            chat_id_val = env_chat
+        elif os.getenv("DATABASE_URL", "").strip():
+            # best-effort DB fallback
             try:
-                chat_id = int(env_chat)
+                db.init_db()
+                chat_id_val = (db.get_setting("telegram_chat_id") or "").strip()
             except Exception:
-                raise HTTPException(status_code=500, detail="TELEGRAM_CHAT_ID is invalid")
-
-    # DB fallback
-    if chat_id is None and os.getenv("DATABASE_URL", "").strip():
-        try:
-            db.init_db()
-            v = (db.get_setting("telegram_chat_id") or "").strip()
-            if v:
-                chat_id = int(v)
-        except Exception:
-            pass
-
-    if chat_id is None:
-        raise HTTPException(
-            status_code=400,
-            detail="chat_id missing (set TELEGRAM_CHAT_ID, talk to the bot once with DB enabled, or send {\"chat_id\": <int>})",
-        )
-
-    # Build and send Daily Brief text (PRD-style sections when Notion is enabled)
-    text = build_daily_brief_text(chat_id, STATE)
+                chat_id_val = None
 
     try:
-        send_telegram_message(chat_id=int(chat_id), text=str(text))
+        chat_id = int(chat_id_val)
+    except Exception:
+        raise HTTPException(status_code=400, detail="chat_id missing")
+
+    # --- build brief text ---
+    try:
+        brief_text = core_mod.build_daily_brief_text(chat_id, STATE)
+    except Exception as e:
+        # Keep API predictable for ops/debugging
+        return JSONResponse(
+            status_code=500,
+            content={"ok": False, "error": "brief_failed", "detail": str(e)},
+        )
+
+    actions = [{"type": "reply", "chat_id": chat_id, "text": brief_text}]
+    sent = 0
+    errors = 0
+
+    # --- send message (best-effort; don't fail cron on missing token in dev/tests) ---
+    try:
+        try:
+            send_telegram_message(chat_id, brief_text)
+        except TypeError:
+            # backwards-compat if tests monkeypatch send_telegram_message(chat_id, text)
+            send_telegram_message(chat_id, brief_text)
         sent = 1
-        errors = 0
     except RuntimeError:
         # Missing token in dev/test should not be treated as an error
-        sent = 0
-        errors = 0
+        pass
     except Exception:
-        sent = 0
-        errors = 1
+        errors += 1
 
-    actions = [{"type": "reply", "chat_id": chat_id, "text": text}]
     return {"ok": True, "sent": sent, "errors": errors, "actions": actions}
