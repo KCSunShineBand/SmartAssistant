@@ -1031,3 +1031,65 @@ def update_task_title(task_page_id: str, title: str) -> bool:
             return True
 
     return False
+
+
+def update_task_description(task_page_id: str, description: str) -> bool:
+    """
+    Update a task's Description (rich_text) in Notion.
+
+    - Uses property name "Description" first.
+    - If the DB uses a different name, falls back to "Details" on 400.
+    - Allows clearing: empty/whitespace description => rich_text: []
+    """
+    import os
+    import requests
+
+    raw_token = os.getenv("NOTION_TOKEN") or ""
+    token = raw_token.strip().replace("\r", "").replace("\n", "")
+    if not token:
+        raise RuntimeError("NOTION_TOKEN is not set")
+
+    notion_version = (os.getenv("NOTION_VERSION") or "2022-06-28").strip() or "2022-06-28"
+
+    task_page_id = (task_page_id or "").strip()
+    if not task_page_id:
+        raise ValueError("task_page_id is required")
+
+    # NOTE: empty is allowed (means clear)
+    desc = "" if description is None else str(description)
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Notion-Version": notion_version,
+        "Content-Type": "application/json",
+    }
+
+    def _payload(prop_name: str) -> dict:
+        cleaned = desc.strip()
+        if cleaned:
+            rich_text = [{"type": "text", "text": {"content": cleaned}}]
+        else:
+            # Clear the property
+            rich_text = []
+        return {"properties": {prop_name: {"rich_text": rich_text}}}
+
+    def _patch(prop_name: str):
+        return requests.request(
+            "PATCH",
+            f"https://api.notion.com/v1/pages/{task_page_id}",
+            headers=headers,
+            json=_payload(prop_name),
+            timeout=30,
+        )
+
+    r1 = _patch("Description")
+    if r1.status_code in (200, 201):
+        return True
+
+    # fallback if "Description" isn't a property in this DB
+    if r1.status_code == 400:
+        r2 = _patch("Details")
+        if r2.status_code in (200, 201):
+            return True
+
+    return False

@@ -369,14 +369,17 @@ async def telegram_webhook(request: Request):
         if not tasks:
             return ("All done 🎉", None)
 
+        def _desc_or_dash(s: str) -> str:
+            s2 = (s or "").strip()
+            return s2 if s2 else "—"
+
         if list_kind == "today":
             header = f"Open tasks: {len(tasks)}"
             lines = []
             for i, t in enumerate(tasks, start=1):
                 title = (t.get("title") or "").strip()
-                due = t.get("due")
-                due_txt = f" (due {due})" if due else ""
-                lines.append(f"{i}. {title}{due_txt}")
+                desc = _desc_or_dash(t.get("description") or "")
+                lines.append(f"{i}. {title} | {desc}")
             return (header + "\n" + "\n".join(lines), _two_button_markup())
 
         if list_kind == "inbox":
@@ -384,13 +387,22 @@ async def telegram_webhook(request: Request):
             lines = []
             for i, t in enumerate(tasks, start=1):
                 title = (t.get("title") or "").strip()
-                due = t.get("due")
-                status = t.get("status") or "todo"
-                due_txt = f" (due {due})" if due else ""
-                lines.append(f"{i}. [{status}] {title}{due_txt}")
+                desc = _desc_or_dash(t.get("description") or "")
+                lines.append(f"{i}. {title} | {desc}")
             return (header + "\n" + "\n".join(lines), _two_button_markup())
 
-        return (f"Tasks: {len(tasks)}", _two_button_markup())
+        # fallback
+        header = f"Tasks: {len(tasks)}"
+        lines = []
+        for i, t in enumerate(tasks, start=1):
+            title = (t.get("title") or t.get("text") or "").strip()
+            desc = (t.get("description") or "").strip()
+            if desc:
+                lines.append(f"{i}. {title} | {desc}")
+            else:
+                lines.append(f"{i}. {title}")
+        return (header + "\n" + "\n".join(lines), _two_button_markup())
+
 
     for a in actions:
         # execute edit actions (update cached list + edit the original message)
@@ -416,15 +428,28 @@ async def telegram_webhook(request: Request):
                 tasks = list(cache.get("tasks") or [])
                 list_kind = cache.get("list_kind") or "today"
 
-                # apply title update
+
+                # apply title/description update
                 if isinstance(update_task, dict) and update_task.get("id"):
                     uid = str(update_task.get("id"))
-                    new_title = str(update_task.get("title") or "").strip()
-                    if new_title:
+
+                    # title: only update when a non-empty title is provided
+                    if "title" in update_task:
+                        new_title = str(update_task.get("title") or "").strip()
+                        if new_title:
+                            for t in tasks:
+                                if str(t.get("id")) == uid:
+                                    t["title"] = new_title
+                                    break
+
+                    # description: update even if empty string (allows clearing)
+                    if "description" in update_task:
+                        new_desc = str(update_task.get("description") or "").strip()
                         for t in tasks:
                             if str(t.get("id")) == uid:
-                                t["title"] = new_title
+                                t["description"] = new_desc
                                 break
+
 
                 # apply removal
                 if remove_task_id:

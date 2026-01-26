@@ -99,10 +99,12 @@ SUPPORTED_COMMANDS = {
     "search",
     "inbox",
     "settings",
+    "cancel",
     # optional quality-of-life aliases (won't break MVP)
     "start",
     "help",
 }
+
 
 
 def route_text(text: str) -> dict:

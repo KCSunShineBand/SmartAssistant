@@ -772,46 +772,136 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
                     "task_id": task_id,
                     "item_number": idx,
                 }
-                return reply(f"Send the new text for item {idx}.")
+                return reply(
+                    "Send:\n"
+                    f"- New Title  (updates title)\n"
+                    f"- or: New Title | New Description  (updates both)\n"
+                    f"- or: | New Description  (keeps title)\n"
+                    f"For item {idx}."
+                )
+
 
             if mode == "edit_new_text":
                 task_id = str(pending.get("task_id") or "").strip()
                 item_no = pending.get("item_number")
-                new_title = raw
+                user_input = (raw or "").strip()
 
-                if not new_title:
-                    return reply("New text cannot be empty. Send the updated task text.")
+                if not user_input:
+                    return reply(
+                        "Send:\n"
+                        "- New Title\n"
+                        "- or: New Title | New Description\n"
+                        "- or: | New Description (keep title)"
+                    )
 
-                # update title
+                # Pull the original task (from cache) so we can keep title/desc if needed
+                def _get_cached_task_for_item(item_number: int) -> Dict[str, Any] | None:
+                    try:
+                        smid = int(source_mid)
+                    except Exception:
+                        return None
+                    cache = state.render_cache.get((chat_id, smid)) or {}
+                    tasks = cache.get("tasks") or []
+                    if not isinstance(tasks, list) or not tasks:
+                        return None
+                    if item_number < 1 or item_number > len(tasks):
+                        return None
+                    t = tasks[item_number - 1]
+                    return t if isinstance(t, dict) else None
+
+                original = _get_cached_task_for_item(int(item_no) if str(item_no).isdigit() else 0) or {}
+                old_title = (original.get("title") or "").strip()
+                old_desc = (original.get("description") or "").strip()
+
+                # Parse user input
+                # - "Title | Desc" => both
+                # - "| Desc" => desc only
+                # - "Title" => title only
+                new_title = None
+                new_desc = None
+
+                if "|" in user_input:
+                    left, right = user_input.split("|", 1)
+                    left = left.strip()
+                    right = right.strip()
+
+                    if left:
+                        new_title = left
+                    if right:
+                        new_desc = right
+                    else:
+                        # allow clearing description by sending "Title |"
+                        new_desc = ""
+
+                    if (new_title is None) and (new_desc is None):
+                        return reply(
+                            "Invalid format.\n"
+                            "Use: New Title | New Description\n"
+                            "or: | New Description\n"
+                            "or: New Title"
+                        )
+                else:
+                    new_title = user_input
+
+                # Apply updates
+                ok = True
+
                 if notion_enabled:
-                    notion.update_task_title(task_id, new_title)
+                    # Update title if requested
+                    if new_title is not None:
+                        ok = bool(notion.update_task_title(task_id, new_title)) and ok
+
+                    # Update description if requested
+                    if new_desc is not None:
+                        ok = bool(notion.update_task_description(task_id, new_desc)) and ok
+
                 elif db_enabled:
-                    # optional: implement later if you still use DB task lists
+                    # optional: implement later if DB task lists are still used
                     try:
                         db.init_db()
-                        if hasattr(db, "update_task_text"):
+                        if new_title is not None and hasattr(db, "update_task_text"):
                             db.update_task_text(chat_id, task_id, new_title)
+                        # description in DB mode not supported yet
                     except Exception:
                         pass
                 else:
-                    for t in state.tasks[chat_id]:
-                        if t.id == task_id:
-                            t.text = new_title
-                            break
+                    # in-memory fallback only supports text/title (no structured description)
+                    if new_title is not None:
+                        for t in state.tasks[chat_id]:
+                            if t.id == task_id:
+                                t.text = new_title
+                                break
 
                 state.pending.pop(chat_id, None)
 
+                if not ok:
+                    return reply("Update failed. Try /today then Edit again.")
+
+                # Update the list message (edit action). Update title in cache if present.
                 try:
                     smid = int(source_mid)
                 except Exception:
-                    return reply(f"Updated item {item_no}. (Could not update the list message.)")
+                    # still confirm success even if we can't edit the message
+                    final_title = new_title if new_title is not None else old_title
+                    final_desc = new_desc if new_desc is not None else old_desc
+                    if final_desc is not None:
+                        return reply(f"Updated item {item_no}: {final_title} | {final_desc}")
+                    return reply(f"Updated item {item_no}: {final_title}")
+
+                # For UI refresh: update title/desc in rendered cache via edit event payload
+                updated = {"id": task_id}
+                if new_title is not None:
+                    updated["title"] = new_title
+                if new_desc is not None:
+                    updated["description"] = new_desc
 
                 return [{
                     "type": "edit",
                     "chat_id": chat_id,
                     "message_id": smid,
-                    "update_task": {"id": task_id, "title": new_title},
+                    "update_task": updated,
                 }]
+
 
     # --- routing commands ---
     if route.get("kind") == "pick_action":
@@ -837,6 +927,13 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
 
     if route.get("kind") == "command":
         cmd = route.get("command")
+
+        if cmd == "cancel":
+            # Exit any multi-step flow safely
+            state.todo_wizard.pop(chat_id, None)
+            state.pending.pop(chat_id, None)
+            return reply("Cancelled ✅")
+
 
         if cmd == "note":
             note_text = (route.get("text") or "").strip()
@@ -1340,14 +1437,19 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
         if cmd == "help":
             return reply(
                 "Commands:\n"
-                "/note <text>\n"
-                "/todo <text>\n"
-                "/inbox\n"
-                "/today\n"
-                "/done <task_id>\n"
-                "/settings\n"
-                "/search <query>"
+                "Send any text - saves a note\n"
+                "/note <text> - save a note\n"
+                "/todo - (Notion mode) task wizard: pick Title, then add Description\n"
+                "/todo <title> - set Title, then send the Description\n"
+                "/todo Title | Description - create instantly ('|' is reserved)\n"
+                "/today - list open tasks (tap Done/Edit, then reply with item number)\n"
+                "/inbox - list more open tasks\n"
+                "/done <task_id> - mark done (IDs may appear in /search)\n"
+                "/search <query> - search notes/tasks\n"
+                "/settings - view/update settings (/settings set <key> <value>)\n"
+                "/help"
             )
+
 
         return reply(f"Command not implemented yet: /{cmd}")
 
@@ -1356,6 +1458,11 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
         note_text = (route.get("text") or "").strip()
         if not note_text:
             return reply("Empty message")
+
+        # Safety: never treat "/something" as a note (even if router misclassified it)
+        if note_text.startswith("/"):
+            return reply("Unknown command. Try /help")
+
 
         if notion_enabled:
             page_id = notion.create_note(
