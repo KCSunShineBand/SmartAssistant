@@ -13,3 +13,10 @@ __pycache__/
 # Secrets
 *.env
 .env.*
+
+
+# Handover artifacts (keep out of repo)
+docs/handover/*.docx
+docs/handover/*.pdf
+docs/handover/*.pptx
+docs/handover/*.xlsx
