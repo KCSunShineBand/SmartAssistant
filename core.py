@@ -1037,7 +1037,7 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
         if cmd == "today":
             # --- Notion mode ---
             if notion_enabled:
-                tasks = notion.list_open_tasks(tasks_db_id, limit=5)
+                tasks = notion.list_open_tasks(tasks_db_id, limit=200)
                 if not tasks:
                     return reply("No open tasks. Go touch grass 🌱")
 
@@ -1155,7 +1155,7 @@ def handle_event(event: Dict[str, Any], state: AppState) -> List[Dict[str, Any]]
 
         if cmd == "inbox":
             if notion_enabled:
-                tasks = notion.list_inbox_tasks(tasks_db_id, limit=20)
+                tasks = notion.list_inbox_tasks(tasks_db_id, limit=200)
                 if not tasks:
                     return reply("Inbox is empty. Suspiciously productive. 😎")
 
